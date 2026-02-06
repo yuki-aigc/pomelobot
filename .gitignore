@@ -1,0 +1,19 @@
+node_modules/
+dist/
+*.log
+logs/
+.env
+config.local.json
+
+# Keep workspace structure but ignore daily memory logs
+workspace/memory/*.md
+!workspace/memory/.gitkeep
+config.json
+config.json.bak
+
+# workspace目录
+workspace/config/
+workspace/momory/
+
+# Qwen Code目录
+.qwen/config/settings.json

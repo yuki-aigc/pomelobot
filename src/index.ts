@@ -1,0 +1,454 @@
+import { createInterface } from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+import crypto from 'node:crypto';
+
+import { ChatOpenAI } from '@langchain/openai';
+import { createAgent } from './agent.js';
+import type { ExecApprovalPrompt, ExecApprovalRequest, ExecApprovalDecision } from './agent.js';
+import { loadConfig } from './config.js';
+import {
+    estimateTotalTokens,
+    shouldAutoCompact,
+    getContextUsageInfo,
+    formatTokenCount,
+    compactMessages,
+} from './compaction/index.js';
+import { parseCommand, handleCommand, type CommandContext } from './commands/index.js';
+import {
+    createMemoryFlushState,
+    updateTokenCount,
+    shouldTriggerMemoryFlush,
+    markFlushCompleted,
+    isNoReplyResponse,
+    getTokenUsageInfo,
+    MEMORY_FLUSH_SYSTEM_PROMPT,
+    MEMORY_FLUSH_USER_PROMPT,
+    type MemoryFlushState,
+} from './middleware/index.js';
+
+// ANSI terminal colors
+const colors = {
+    reset: '\x1b[0m',
+    bright: '\x1b[1m',
+    dim: '\x1b[2m',
+    gray: '\x1b[90m',
+    white: '\x1b[37m',
+    blue: '\x1b[34m',
+    cyan: '\x1b[36m',
+    green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    red: '\x1b[31m',
+    orange: '\x1b[38;5;208m',
+    black: '\x1b[30m',
+    magenta: '\x1b[35m',
+};
+
+/**
+ * Format markdown syntax in terminal output
+ * - # Header -> bold yellow
+ * - ## Header -> bold white
+ * - **text** -> bold text
+ * - `text` -> cyan highlighted text
+ * - - list item -> with bullet
+ */
+function formatMarkdown(text: string): string {
+    let result = text;
+
+    // Handle headers - must be at start of line
+    // # Header -> bold yellow
+    if (result.match(/^#{1}\s+/)) {
+        result = result.replace(/^#\s+(.*)$/, `${colors.bright}${colors.yellow}$1${colors.reset}`);
+    }
+    // ## Header -> bold white
+    else if (result.match(/^#{2,}\s+/)) {
+        result = result.replace(/^#{2,}\s+(.*)$/, `${colors.bright}${colors.white}$1${colors.reset}`);
+    }
+
+    // Replace **bold** with bright/bold text
+    result = result.replace(/\*\*([^*]+)\*\*/g, `${colors.bright}${colors.white}$1${colors.reset}`);
+
+    // Replace `code` with cyan text
+    result = result.replace(/`([^`]+)`/g, `${colors.cyan}$1${colors.reset}`);
+
+    // Replace list items - at start of line
+    result = result.replace(/^(\s*)-\s+/, `$1${colors.cyan}•${colors.reset} `);
+
+    // Replace numbered list items
+    result = result.replace(/^(\s*)(\d+)\.\s+/, `$1${colors.cyan}$2.${colors.reset} `);
+
+    return result;
+}
+
+/**
+ * Print the header
+ */
+function printHeader(config: ReturnType<typeof loadConfig>) {
+    const cwd = process.cwd();
+    const model = config.openai.model;
+
+    const o = colors.orange;
+    const r = colors.reset;
+    const g = colors.gray;
+    const b = colors.bright;
+    const rd = colors.red;
+
+    console.log();
+    console.log(`     ${o}▄▄▄▄▄${r}        ${b}SRE Bot${r} ${g}v1.0.0${r}`);
+    console.log(`   ${o}█ ${r}●   ●${o} █      ${g}${model}${r} ${g}· API Usage Billing${r}`);
+    console.log(`   ${o}█ ${rd}      ${o}█      ${g}Memory & Skills Enabled${r}`);
+    console.log(`    ${o}▀▀▀▀▀▀▀${r}       ${g}${cwd}${r}`);
+    console.log(`     ${g}▀   ▀${r}`);
+    console.log();
+    console.log(` ${g}Welcome to SRE Bot. Type "/help" for commands, "exit" to quit.${r}\n`);
+}
+
+async function main() {
+    const config = loadConfig();
+    const approvalsEnabled = config.exec.approvals.enabled;
+    const execApprovalPrompt: ExecApprovalPrompt | undefined = approvalsEnabled
+        ? async (request: ExecApprovalRequest): Promise<ExecApprovalDecision> => {
+            console.log();
+            console.log(`${colors.yellow}● Exec 审批${colors.reset}`);
+            console.log(`${colors.gray}调用ID:${colors.reset} ${request.callId}`);
+            console.log(`${colors.gray}命令:${colors.reset} ${request.command}`);
+            console.log(`${colors.gray}目录:${colors.reset} ${request.cwd}`);
+            console.log(`${colors.gray}超时:${colors.reset} ${request.timeoutMs}ms`);
+            console.log(`${colors.gray}策略:${colors.reset} ${request.policyStatus}${request.policyReason ? ` (${request.policyReason})` : ''}`);
+            if (request.riskReasons.length > 0) {
+                console.log(`${colors.gray}风险:${colors.reset} ${request.riskLevel} - ${request.riskReasons.join('; ')}`);
+            } else {
+                console.log(`${colors.gray}风险:${colors.reset} ${request.riskLevel}`);
+            }
+
+            const answer = (await rl.question(`${colors.yellow}允许执行?${colors.reset} (y=允许, n=拒绝, e=编辑) `))
+                .trim()
+                .toLowerCase();
+
+            if (answer === 'e') {
+                const edited = (await rl.question(`${colors.gray}输入新命令:${colors.reset} `)).trim();
+                if (edited) {
+                    return {
+                        decision: 'edit',
+                        command: edited,
+                        metadata: {
+                            channel: 'cli',
+                            callId: request.callId,
+                            decisionSource: 'cli',
+                            approverName: process.env.USER || 'local-cli',
+                            decidedAt: new Date().toISOString(),
+                        },
+                    };
+                }
+            }
+
+            if (answer === 'y' || answer === 'yes') {
+                return {
+                    decision: 'approve',
+                    metadata: {
+                        channel: 'cli',
+                        callId: request.callId,
+                        decisionSource: 'cli',
+                        approverName: process.env.USER || 'local-cli',
+                        decidedAt: new Date().toISOString(),
+                    },
+                };
+            }
+
+            const rejectComment = (await rl.question(`${colors.gray}拒绝原因(可选):${colors.reset} `)).trim();
+            console.log(`${colors.red}已拒绝执行命令${colors.reset}`);
+            return {
+                decision: 'reject',
+                comment: rejectComment || undefined,
+                metadata: {
+                    channel: 'cli',
+                    callId: request.callId,
+                    decisionSource: 'cli',
+                    approverName: process.env.USER || 'local-cli',
+                    decidedAt: new Date().toISOString(),
+                },
+            };
+        }
+        : undefined;
+
+    const { agent } = await createAgent(config, { execApprovalPrompt });
+
+    // Create model instance for compaction
+    const compactionModel = new ChatOpenAI({
+        model: config.openai.model,
+        apiKey: config.openai.api_key,
+        configuration: { baseURL: config.openai.base_url },
+        maxRetries: config.openai.max_retries ?? 3,
+        temperature: 0,
+    });
+
+    printHeader(config);
+
+    const rl = createInterface({ input, output });
+
+    // Session state
+    let threadId = `thread-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+    let sessionStartTime = new Date();
+    let messageHistory: import('@langchain/core/messages').BaseMessage[] = [];
+    let flushState: MemoryFlushState = createMemoryFlushState();
+    let hasConversation = false;
+
+    const getAgentConfig = () => ({
+        configurable: { thread_id: threadId },
+        recursionLimit: config.agent.recursion_limit,
+    });
+
+    const getCommandContext = (): CommandContext => ({
+        model: compactionModel,
+        config: config.agent.compaction,
+        currentTokens: flushState.totalTokens,
+        threadId,
+        sessionStartTime,
+    });
+
+    /**
+     * Execute memory flush - save conversation summary to memory file
+     */
+    async function executeMemoryFlush(): Promise<void> {
+        process.stdout.write(`${colors.gray}● ${colors.reset}${colors.dim}Saving memory...${colors.reset}`);
+
+        try {
+            const result = await agent.invoke(
+                {
+                    messages: [
+                        { role: 'system', content: MEMORY_FLUSH_SYSTEM_PROMPT },
+                        { role: 'user', content: MEMORY_FLUSH_USER_PROMPT },
+                    ],
+                },
+                {
+                    ...getAgentConfig(),
+                    recursionLimit: 10,
+                }
+            );
+
+            const messages = result.messages;
+            if (Array.isArray(messages) && messages.length > 0) {
+                const lastMessage = messages[messages.length - 1];
+                const content = typeof lastMessage.content === 'string' ? lastMessage.content : '';
+
+                process.stdout.write(isNoReplyResponse(content) ? ` ${colors.green}✓${colors.reset}\n` : ` ${colors.gray}(saved)${colors.reset}\n`);
+            }
+
+            flushState = markFlushCompleted(flushState);
+        } catch (error) {
+            process.stdout.write(` ${colors.red}✗${colors.reset}\n`);
+            console.error(`${colors.red}Error during memory flush:${colors.reset}`, error instanceof Error ? error.message : error);
+        }
+    }
+
+    /**
+     * Execute auto-compaction if needed (with memory flush first)
+     */
+    async function executeAutoCompact(): Promise<void> {
+        if (!shouldAutoCompact(flushState.totalTokens, config.agent.compaction)) {
+            return;
+        }
+
+        // First: flush memory to save important info
+        if (shouldTriggerMemoryFlush(flushState, config.agent.compaction)) {
+            await executeMemoryFlush();
+        }
+
+        // Then: compact context
+        process.stdout.write(`${colors.gray}● ${colors.reset}${colors.dim}Auto-compacting context...${colors.reset}`);
+
+        try {
+            const maxTokens = Math.floor(config.agent.compaction.context_window * config.agent.compaction.max_history_share);
+            const result = await compactMessages(messageHistory, compactionModel, maxTokens);
+
+            messageHistory = result.messages;
+            flushState = markFlushCompleted(flushState);
+
+            const saved = result.tokensBefore - result.tokensAfter;
+            process.stdout.write(` ${colors.green}✓${colors.reset} (${formatTokenCount(saved)} saved)\n`);
+        } catch (error) {
+            process.stdout.write(` ${colors.red}✗${colors.reset}\n`);
+            console.error(`${colors.red}Error during compaction:${colors.reset}`, error instanceof Error ? error.message : error);
+        }
+    }
+
+    /**
+     * Reset session for /new command
+     */
+    function resetSession(newThreadId: string): void {
+        threadId = newThreadId;
+        sessionStartTime = new Date();
+        messageHistory = [];
+        flushState = createMemoryFlushState();
+        hasConversation = false;
+    }
+
+    let isExiting = false;
+
+    /**
+     * Graceful exit with memory flush
+     */
+    async function gracefulExit(): Promise<void> {
+        if (isExiting) return;
+        isExiting = true;
+
+        if (config.agent.compaction.enabled && hasConversation && flushState.totalTokens > 0) {
+            console.log();
+            await executeMemoryFlush();
+        }
+
+        console.log(`\n${colors.gray}Goodbye! 👋${colors.reset}`);
+        rl.close();
+        process.exit(0);
+    }
+
+    // Handle Ctrl+C gracefully
+    process.on('SIGINT', () => {
+        gracefulExit().catch(console.error);
+    });
+
+    // Also handle readline close event (e.g., when terminal is closed)
+    rl.on('close', () => {
+        if (!isExiting) {
+            gracefulExit().catch(console.error);
+        }
+    });
+
+    try {
+        while (true) {
+            const userPromptText = `${colors.gray}❯ ${colors.reset}`;
+            const userInput = await rl.question(userPromptText);
+
+            if (!userInput.trim()) {
+                continue;
+            }
+
+            if (userInput.toLowerCase() === 'exit' || userInput.toLowerCase() === 'quit') {
+                await gracefulExit();
+                break;
+            }
+
+            // Check for slash commands
+            if (userInput.trim().startsWith('/')) {
+                const result = await handleCommand(userInput, getCommandContext(), messageHistory);
+
+                if (result.handled) {
+                    console.log();
+                    console.log(`${colors.white}● ${colors.reset}${result.response || ''}`);
+
+                    if (result.action === 'new_session' && result.newThreadId) {
+                        // Flush memory before starting new session
+                        if (hasConversation && flushState.totalTokens > 0) {
+                            await executeMemoryFlush();
+                        }
+                        resetSession(result.newThreadId);
+                    } else if (result.action === 'compact' && result.compactionResult) {
+                        // Flush memory then compact
+                        await executeMemoryFlush();
+                        const maxTokens = Math.floor(config.agent.compaction.context_window * config.agent.compaction.max_history_share);
+                        const compactResult = await compactMessages(messageHistory, compactionModel, maxTokens);
+                        messageHistory = compactResult.messages;
+                        flushState = markFlushCompleted(flushState);
+                    }
+
+                    console.log();
+                    console.log(`${colors.gray}${'━'.repeat(output.columns || 50)}${colors.reset}`);
+                    console.log();
+                    continue;
+                }
+            }
+
+            hasConversation = true;
+            flushState = updateTokenCount(flushState, userInput);
+
+            // Check auto-compact before processing
+            await executeAutoCompact();
+
+            try {
+                console.log();
+                process.stdout.write(`${colors.white}● ${colors.reset}`);
+
+                let fullResponse = '';
+
+                const eventStream = agent.streamEvents(
+                    { messages: [{ role: 'user', content: userInput }] },
+                    { ...getAgentConfig(), version: 'v2' }
+                );
+
+                let lineBuffer = '';  // Buffer for current line
+
+                for await (const event of eventStream) {
+                    if (event.event === 'on_chat_model_stream') {
+                        const chunk = event.data?.chunk;
+                        if (chunk?.content) {
+                            let text = '';
+                            if (typeof chunk.content === 'string') {
+                                text = chunk.content;
+                            } else if (Array.isArray(chunk.content)) {
+                                for (const item of chunk.content) {
+                                    if (item.type === 'text' && item.text) {
+                                        text += item.text;
+                                    }
+                                }
+                            }
+
+                            fullResponse += text;
+
+                            // Process character by character for line buffering
+                            for (const char of text) {
+                                if (char === '\n') {
+                                    // End of line - format and output
+                                    process.stdout.write(formatMarkdown(lineBuffer) + '\n');
+                                    lineBuffer = '';
+                                } else {
+                                    lineBuffer += char;
+                                }
+                            }
+                        }
+                    } else if (event.event === 'on_tool_start') {
+                        const toolName = event.name;
+                        // Output any buffered content first
+                        if (lineBuffer) {
+                            process.stdout.write(formatMarkdown(lineBuffer));
+                            lineBuffer = '';
+                        }
+                        process.stdout.write(`${colors.gray}[${toolName}]${colors.reset} `);
+                    }
+                }
+
+                // Output any remaining buffered content
+                if (lineBuffer) {
+                    process.stdout.write(formatMarkdown(lineBuffer));
+                }
+
+                // Update token count and message history
+                flushState = updateTokenCount(flushState, fullResponse);
+                const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
+                messageHistory.push(new HumanMessage(userInput));
+                if (fullResponse) {
+                    messageHistory.push(new AIMessage(fullResponse));
+                }
+
+                console.log();
+                console.log(`${colors.gray}  ${getTokenUsageInfo(flushState, config.agent.compaction)}${colors.reset}`);
+
+                // Check auto-compact after response
+                await executeAutoCompact();
+
+                console.log();
+                console.log(`${colors.gray}${'━'.repeat(output.columns || 50)}${colors.reset}`);
+                console.log();
+            } catch (error) {
+                console.error(`\n${colors.red}Error:${colors.reset}`, error instanceof Error ? error.message : error);
+                console.log();
+            }
+        }
+    } catch (error) {
+        if (!(error instanceof Error && error.name === 'AbortError')) {
+            throw error;
+        }
+    }
+
+    rl.close();
+}
+
+main().catch(console.error);

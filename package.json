@@ -1,0 +1,36 @@
+{
+    "name": "deepagents-srebot",
+    "version": "1.0.0",
+    "description": "A DeepAgents-based intelligent agent with memory, skills, and subagent support",
+    "main": "dist/index.js",
+    "type": "module",
+    "scripts": {
+        "dev": "tsx src/index.ts",
+        "dingtalk": "tsx src/dingtalk.ts",
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "typecheck": "tsc --noEmit"
+    },
+    "keywords": [
+        "deepagents",
+        "ai",
+        "agent",
+        "sre"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "deepagents": "^1.6.1",
+        "@langchain/openai": "^1.2.4",
+        "@langchain/langgraph": "^1.1.2",
+        "@langchain/core": "^1.1.17",
+        "zod": "^3.23.0",
+        "dingtalk-stream": "^2.1.4",
+        "axios": "^1.7.0"
+    },
+    "devDependencies": {
+        "typescript": "^5.5.0",
+        "tsx": "^4.19.0",
+        "@types/node": "^22.0.0"
+    }
+}

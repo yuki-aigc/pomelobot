@@ -1,0 +1,41 @@
+{
+    "allowedCommands": [
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "grep",
+        "find",
+        "pwd",
+        "echo",
+        "date",
+        "whoami",
+        "df",
+        "free",
+        "uptime",
+        "ps",
+        "top",
+        "netstat",
+        "curl",
+        "ping",
+        "dig",
+        "nslookup",
+        "kubectl",
+        "docker",
+        "mkdir",
+        "microdnf",
+        "gh",
+        "git",
+        "qwen",
+        "python",
+        "claude"
+    ],
+    "deniedCommands": [
+        "rm",
+        "mv",
+        "chmod",
+        "chown",
+        "sudo",
+        "su"
+    ]
+}

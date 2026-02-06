@@ -1,0 +1,137 @@
+import type { CompactionConfig } from '../config.js';
+
+/**
+ * Estimate token count for a text string
+ * Uses a simple heuristic: ~1 token per Chinese character, ~1 token per 4 English characters
+ */
+export function estimateTokens(text: string): number {
+    if (!text) return 0;
+
+    // Count Chinese characters (each is roughly 1 token)
+    const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+
+    // Count English words (each word is roughly 1.3 tokens on average)
+    const englishWords = (text.match(/[a-zA-Z]+/g) || []).length;
+
+    // Count numbers and special characters
+    const otherChars = text.replace(/[\u4e00-\u9fa5a-zA-Z\s]/g, '').length;
+
+    return Math.ceil(chineseChars + englishWords * 1.3 + otherChars * 0.5);
+}
+
+/**
+ * Memory flush state tracker
+ */
+export interface MemoryFlushState {
+    totalTokens: number;
+    lastFlushTokens: number;  // Token count at last flush
+    lastFlushAt: number;
+    flushCount: number;
+    conversationSummary: string[];  // Track key points from conversation
+}
+
+/**
+ * Create a new memory flush state
+ */
+export function createMemoryFlushState(): MemoryFlushState {
+    return {
+        totalTokens: 0,
+        lastFlushTokens: 0,
+        lastFlushAt: 0,
+        flushCount: 0,
+        conversationSummary: [],
+    };
+}
+
+/**
+ * Check if memory flush should be triggered (before compaction)
+ */
+export function shouldTriggerMemoryFlush(
+    state: MemoryFlushState,
+    config: CompactionConfig
+): boolean {
+    if (!config.enabled) return false;
+
+    // Trigger memory flush slightly before auto-compact threshold
+    const flushThreshold = config.auto_compact_threshold * 0.9;
+
+    return state.totalTokens >= flushThreshold;
+}
+
+export const MEMORY_FLUSH_SYSTEM_PROMPT = `
+[系统提示] 会话上下文即将压缩。你必须执行以下操作：
+
+1. 立即使用 memory_save 工具保存本次对话的关键信息
+2. 必须保存的内容包括：
+   - 用户在本次对话中问过的主要问题（摘要形式）
+   - 用户表达的偏好或重要信息
+   - 重要的任务结论或决策
+3. 保存完成后回复 "NO_REPLY"
+
+重要：你必须调用 memory_save 工具，不能只回复 NO_REPLY！
+`;
+
+export const MEMORY_FLUSH_USER_PROMPT = `
+[自动记忆保存 - 强制执行]
+
+请立即执行以下步骤：
+
+STEP 1: 回顾当前对话，总结用户问过的主要问题和关键信息
+STEP 2: 调用 memory_save 工具，将对话摘要保存到 daily 记忆：
+   - content: "对话摘要: [用户问题1], [用户问题2], ..., [关键信息]"
+   - target: "daily"
+STEP 3: 只有在 STEP 2 完成后，才回复 "NO_REPLY"
+
+如果你不调用 memory_save 就直接回复 NO_REPLY，这是错误的行为！
+`;
+
+/**
+ * Update token count in state
+ */
+export function updateTokenCount(
+    state: MemoryFlushState,
+    text: string
+): MemoryFlushState {
+    const newTokens = estimateTokens(text);
+    return {
+        ...state,
+        totalTokens: state.totalTokens + newTokens,
+    };
+}
+
+/**
+ * Mark flush as completed and RESET token count (simulating compaction)
+ */
+export function markFlushCompleted(state: MemoryFlushState): MemoryFlushState {
+    return {
+        ...state,
+        totalTokens: 0,  // Reset after flush (compaction simulation)
+        lastFlushTokens: 0,
+        lastFlushAt: Date.now(),
+        flushCount: state.flushCount + 1,
+        conversationSummary: [],  // Clear summary after flush
+    };
+}
+
+/**
+ * Check if response is a NO_REPLY (should be suppressed)
+ */
+export function isNoReplyResponse(response: string): boolean {
+    const trimmed = response.trim().toUpperCase();
+    return trimmed === 'NO_REPLY' || trimmed.startsWith('NO_REPLY');
+}
+
+/**
+ * Get current token usage info for debugging
+ */
+export function getTokenUsageInfo(state: MemoryFlushState, config: CompactionConfig): string {
+    const percentage = Math.round((state.totalTokens / config.context_window) * 100);
+    return `[Token 使用: ${formatTokens(state.totalTokens)}/${formatTokens(config.context_window)} (${percentage}%), flush 次数: ${state.flushCount}]`;
+}
+
+function formatTokens(tokens: number): string {
+    if (tokens >= 1000) {
+        return `${(tokens / 1000).toFixed(1)}K`;
+    }
+    return `${tokens}`;
+}

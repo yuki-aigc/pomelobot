@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepagents-srebot
+  labels:
+    app: deepagents-srebot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepagents-srebot
+  template:
+    metadata:
+      labels:
+        app: deepagents-srebot
+    spec:
+      containers:
+        - name: srebot
+          image: deepagents-srebot:latest
+          imagePullPolicy: IfNotPresent
+          command: ["pnpm", "dingtalk"]
+          volumeMounts:
+            # 挂载配置文件
+            - name: config-volume
+              mountPath: /app/config.json
+              subPath: config.json
+              readOnly: true
+            # 挂载 workspace 持久化存储
+            - name: workspace-volume
+              mountPath: /app/workspace
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        # 从 Secret 加载配置文件
+        - name: config-volume
+          secret:
+            secretName: deepagents-srebot-config
+        # 从 PVC 加载 workspace
+        - name: workspace-volume
+          persistentVolumeClaim:
+            claimName: deepagents-srebot-workspace
+      restartPolicy: Always
+---
+# Secret 模板 - 用于存储 config.json 配置
+# 注意：实际部署时请替换 <BASE64_ENCODED_CONFIG> 为你的 config.json 内容的 base64 编码
+#
+# 生成 base64 编码的命令：
+#   cat config.json | base64
+#
+# 或者直接用 kubectl 从文件创建 secret（推荐）：
+#   kubectl create secret generic deepagents-srebot-config --from-file=config.json=./config.json
+#
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deepagents-srebot-config
+  labels:
+    app: deepagents-srebot
+type: Opaque
+data:
+  # 将 config.json 内容进行 base64 编码后填入
+  # 示例：echo '{"openai": {...}}' | base64
+  config.json: <BASE64_ENCODED_CONFIG>
+
+---
+# PersistentVolumeClaim - 用于持久化 workspace 目录
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: deepagents-srebot-workspace
+  labels:
+    app: deepagents-srebot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # 使用默认 StorageClass，如需指定特定的 StorageClass，取消下面的注释并修改
+  storageClassName: "your-storage-class"
+  resources:
+    requests:
+      storage: 20Gi

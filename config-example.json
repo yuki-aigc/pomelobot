@@ -1,0 +1,47 @@
+{
+    "openai": {
+        "base_url": "",
+        "model": "",
+        "api_key": "",
+        "max_retries": 3
+    },
+    "agent": {
+        "workspace": "./workspace",
+        "skills_dir": "./workspace/skills",
+        "recursion_limit": 50,
+        "compaction": {
+            "enabled": true,
+            "auto_compact_threshold": 80000,
+            "context_window": 128000,
+            "reserve_tokens": 20000,
+            "max_history_share": 0.5
+        }
+    },
+    "exec": {
+        "enabled": true,
+        "commandsFile": "./exec-commands.json",
+        "defaultTimeoutMs": 30000,
+        "maxOutputLength": 50000,
+        "approvals": {
+            "enabled": true
+        }
+    },
+    "dingtalk": {
+        "enabled": false,
+        "clientId": "",
+        "clientSecret": "",
+        "robotCode": "",
+        "corpId": "",
+        "agentId": "",
+        "messageType": "card",
+        "cardTemplateId": "",
+        "showThinking": true,
+        "debug": false,
+        "execApprovals": {
+            "enabled": false,
+            "mode": "button",
+            "templateId": "",
+            "timeoutMs": 300000
+        }
+    }
+}
