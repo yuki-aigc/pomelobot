@@ -28,7 +28,9 @@
         "git",
         "qwen",
         "python",
-        "claude"
+        "claude",
+        "pip",
+        "pip3"
     ],
     "deniedCommands": [
         "rm",

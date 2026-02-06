@@ -11,6 +11,7 @@ import type {
     SessionState,
     Logger,
     AICardInstance,
+    AICardState,
 } from './types.js';
 import {
     sendBySession,
@@ -22,6 +23,7 @@ import {
     cleanupCardCache,
     downloadMedia,
 } from './client.js';
+import { AICardStatus } from './types.js';
 import { hasPendingApprovalForKey, tryHandleExecApprovalReply } from './approvals.js';
 import {
     createMemoryFlushState,
@@ -331,6 +333,13 @@ async function handleMessageInternal(
             let pendingFlush: NodeJS.Timeout | null = null;
             let flushInFlight = false;
             let flushQueuedFinal = false;
+            let streamFlushError: unknown = null;
+
+            const markStreamError = (err: unknown) => {
+                if (!streamFlushError) {
+                    streamFlushError = err;
+                }
+            };
 
             const flushNow = async (final: boolean) => {
                 if (flushInFlight || !currentCard) {
@@ -347,6 +356,7 @@ async function handleMessageInternal(
                     lastStreamTime = Date.now();
                     lastFlushedLength = fullResponse.length;
                 } catch (streamErr) {
+                    markStreamError(streamErr);
                     log.warn('[DingTalk] Card stream update failed:', String(streamErr));
                 } finally {
                     flushInFlight = false;
@@ -404,20 +414,41 @@ async function handleMessageInternal(
             log.info(`[DingTalk] Stream completed, total events: ${eventCount}, response length: ${fullResponse.length}`);
 
             // Finalize card
+            let shouldFallbackToSessionMessage = false;
             if (fullResponse) {
                 log.info('[DingTalk] Finalizing AI Card...');
-                try {
-                    if (pendingFlush) {
-                        clearTimeout(pendingFlush);
-                        pendingFlush = null;
-                    }
-                    await flushNow(true);
+                if (pendingFlush) {
+                    clearTimeout(pendingFlush);
+                    pendingFlush = null;
+                }
+                await flushNow(true);
+
+                const cardState = currentCard.state as AICardState;
+                if (streamFlushError || cardState !== AICardStatus.FINISHED) {
+                    shouldFallbackToSessionMessage = true;
+                    log.warn(
+                        `[DingTalk] Card finalization incomplete (state=${cardState}), falling back to session markdown reply`
+                    );
+                } else {
                     log.info('[DingTalk] AI Card finalized successfully');
-                } catch (finishErr) {
-                    log.warn('[DingTalk] Card finalization failed:', String(finishErr));
                 }
             } else {
                 log.warn('[DingTalk] No response content to send');
+                fullResponse = '抱歉，我暂时没有生成有效回复，请稍后重试。';
+                shouldFallbackToSessionMessage = true;
+            }
+
+            if (shouldFallbackToSessionMessage) {
+                await sendBySession(
+                    dingtalkConfig,
+                    data.sessionWebhook,
+                    fullResponse,
+                    {
+                        useMarkdown: true,
+                        atUserId: !isDirect ? senderId : null,
+                    },
+                    log
+                );
             }
         } else {
             // Markdown mode: use invoke

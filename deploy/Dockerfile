@@ -12,10 +12,11 @@ RUN sed -i 's@//archive.ubuntu.com@//mirrors.aliyun.com@g' /etc/apt/sources.list
 # 安装系统依赖
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl ca-certificates git vim && \
+        curl ca-certificates git vim python3 python3-pip python3-venv && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
 # 复用 Ubuntu 24.04 内置 ubuntu 用户(UID=1000)，加入 root 组获得类 root 权限
 RUN usermod -g 0 -s /bin/bash ubuntu && \

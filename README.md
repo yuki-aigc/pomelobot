@@ -1,4 +1,4 @@
-# DeepAgents SREBot
+# DeepAgents Bot
 
 一个基于 DeepAgentsJS 的智能助手，参考了OpenClaw的设计理念。具有自主记忆和SKILLS编写/执行能力。
 
