@@ -362,7 +362,7 @@ export async function createSREAgent(
     const subagents = getSubagents(cfg);
 
     // Create memory tools
-    const memoryTools = createMemoryTools(workspacePath);
+    const memoryTools = createMemoryTools(workspacePath, cfg);
 
     // Create exec tool
     const execTool = createExecTool(cfg, execApprovalPrompt);
@@ -402,10 +402,11 @@ ${toolSummaryLines.join('\n')}
 - 不要绕过白名单/审批机制，不要建议规避系统限制。
 
 ## 记忆与历史信息
-- 回答“之前做过什么、历史决策、偏好、待办、时间线”等问题前，先用 memory_search 检索。
+- 回答“之前做过什么、历史决策、偏好、待办、时间线、某人信息、某日期发生了什么”等问题前，先用 memory_search 检索。
+- 当用户问题出现“你还记得吗、之前/上次/刚才、今天/昨天、我们是否聊过”等回溯型表述时，必须先用 memory_search 再回答。
 - 用户明确要求“记住/保存”时，必须调用 memory_save。
 - 日常笔记与临时上下文存入 daily；稳定偏好、长期事实与关键决策存入 long-term。
-- 若记忆检索结果不充分，要明确告知“已检索但未找到足够信息”。
+- 若记忆检索结果不充分，要明确告知“已检索但未找到足够信息”；禁止把猜测当成记忆事实。
 
 ## 命令执行规则
 - 使用 exec_command 执行系统命令。

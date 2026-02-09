@@ -14,6 +14,7 @@ spec:
       labels:
         app: deepagents-srebot
     spec:
+      terminationGracePeriodSeconds: 90
       securityContext:
         runAsUser: 1000
         runAsGroup: 0
@@ -37,6 +38,16 @@ spec:
           image: deepagents-srebot:latest
           imagePullPolicy: IfNotPresent
           command: ["pnpm", "dingtalk"]
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >
+                    echo "[preStop] send SIGTERM to pid 1";
+                    kill -TERM 1 2>/dev/null || true;
+                    sleep 25
           volumeMounts:
             # 挂载配置文件
             - name: config-volume
@@ -63,3 +74,140 @@ spec:
           persistentVolumeClaim:
             claimName: deepagents-srebot-workspace
       restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deepagents-srebot-config
+type: Opaque
+stringData:
+  config.json: |
+    {
+      "llm": {
+        "default_model": "default_model",
+        "models": [
+          {
+            "alias": "default_model",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o",
+            "api_key": "REPLACE_ME"
+          }
+        ]
+      },
+      "agent": {
+        "workspace": "./workspace",
+        "skills_dir": "./workspace/skills",
+        "recursion_limit": 80,
+        "compaction": {
+          "enabled": true,
+          "auto_compact_threshold": 80000,
+          "context_window": 128000,
+          "reserve_tokens": 20000,
+          "max_history_share": 0.5
+        },
+        "memory": {
+          "backend": "pgsql",
+          "pgsql": {
+            "enabled": true,
+            "connection_string": "",
+            "host": "postgres",
+            "port": 5432,
+            "user": "pomelobot",
+            "password": "REPLACE_ME",
+            "database": "pomelobot",
+            "ssl": false,
+            "schema": "pomelobot_memory"
+          },
+          "retrieval": {
+            "mode": "hybrid",
+            "max_results": 8,
+            "min_score": 0.1,
+            "sync_on_search": true,
+            "sync_min_interval_ms": 20000,
+            "hybrid_vector_weight": 0.6,
+            "hybrid_fts_weight": 0.4,
+            "hybrid_candidate_multiplier": 2,
+            "include_session_events": true,
+            "session_events_max_results": 6
+          },
+          "embedding": {
+            "enabled": true,
+            "cache_enabled": true,
+            "providers": [
+              {
+                "provider": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": "text-embedding-3-small",
+                "api_key": "REPLACE_ME",
+                "timeout_ms": 15000
+              }
+            ]
+          },
+          "session_isolation": {
+            "enabled": true,
+            "direct_scope": "main",
+            "group_scope_prefix": "group_"
+          },
+          "transcript": {
+            "enabled": true,
+            "max_chars_per_entry": 3000
+          }
+        }
+      },
+      "exec": {
+        "enabled": true,
+        "commandsFile": "./exec-commands.json",
+        "defaultTimeoutMs": 180000,
+        "maxOutputLength": 50000,
+        "approvals": {
+          "enabled": true
+        }
+      },
+      "mcp": {
+        "enabled": false,
+        "servers": {}
+      },
+      "cron": {
+        "enabled": true,
+        "store": "./workspace/cron/jobs.json",
+        "timezone": "Asia/Shanghai",
+        "runLog": "./workspace/cron/runs.jsonl"
+      },
+      "dingtalk": {
+        "enabled": true,
+        "clientId": "REPLACE_ME",
+        "clientSecret": "REPLACE_ME",
+        "robotCode": "REPLACE_ME",
+        "corpId": "REPLACE_ME",
+        "agentId": "REPLACE_ME",
+        "messageType": "card",
+        "cardTemplateId": "REPLACE_ME",
+        "showThinking": false,
+        "debug": false,
+        "voice": {
+          "enabled": true,
+          "requireRecognition": true,
+          "prependRecognitionHint": true
+        },
+        "execApprovals": {
+          "enabled": false,
+          "mode": "button",
+          "templateId": "",
+          "timeoutMs": 300000
+        }
+      }
+    }
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: deepagents-srebot-workspace
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

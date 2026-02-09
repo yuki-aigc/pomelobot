@@ -41,11 +41,74 @@ export interface CompactionConfig {
     max_history_share: number;
 }
 
+export type AgentMemoryBackend = 'filesystem' | 'pgsql';
+export type AgentMemoryRetrievalMode = 'keyword' | 'fts' | 'vector' | 'hybrid';
+
+export interface AgentMemoryPgsqlConfig {
+    enabled: boolean;
+    connection_string?: string;
+    host?: string;
+    port: number;
+    user?: string;
+    password?: string;
+    database?: string;
+    ssl: boolean;
+    schema: string;
+}
+
+export interface AgentMemoryRetrievalConfig {
+    mode: AgentMemoryRetrievalMode;
+    max_results: number;
+    min_score: number;
+    sync_on_search: boolean;
+    sync_min_interval_ms: number;
+    hybrid_vector_weight: number;
+    hybrid_fts_weight: number;
+    hybrid_candidate_multiplier: number;
+    include_session_events: boolean;
+    session_events_max_results: number;
+}
+
+export interface AgentMemoryEmbeddingProviderConfig {
+    provider: 'openai';
+    base_url: string;
+    model: string;
+    api_key: string;
+    timeout_ms: number;
+}
+
+export interface AgentMemoryEmbeddingConfig {
+    enabled: boolean;
+    cache_enabled: boolean;
+    providers: AgentMemoryEmbeddingProviderConfig[];
+}
+
+export interface AgentMemorySessionIsolationConfig {
+    enabled: boolean;
+    direct_scope: 'main' | 'direct';
+    group_scope_prefix: string;
+}
+
+export interface AgentMemoryTranscriptConfig {
+    enabled: boolean;
+    max_chars_per_entry: number;
+}
+
+export interface AgentMemoryConfig {
+    backend: AgentMemoryBackend;
+    pgsql: AgentMemoryPgsqlConfig;
+    retrieval: AgentMemoryRetrievalConfig;
+    embedding: AgentMemoryEmbeddingConfig;
+    session_isolation: AgentMemorySessionIsolationConfig;
+    transcript: AgentMemoryTranscriptConfig;
+}
+
 export interface AgentConfig {
     workspace: string;
     skills_dir: string;
     recursion_limit: number;
     compaction: CompactionConfig;
+    memory: AgentMemoryConfig;
 }
 
 export interface ExecCommandsFile {
@@ -219,6 +282,54 @@ const DEFAULT_CONFIG = {
             reserve_tokens: 20000,
             max_history_share: 0.5,
         },
+        memory: {
+            backend: 'filesystem' as const,
+            pgsql: {
+                enabled: false,
+                connection_string: '',
+                host: '127.0.0.1',
+                port: 5432,
+                user: 'pomelobot',
+                password: '',
+                database: 'pomelobot',
+                ssl: false,
+                schema: 'pomelobot_memory',
+            },
+            retrieval: {
+                mode: 'keyword' as const,
+                max_results: 8,
+                min_score: 0.1,
+                sync_on_search: true,
+                sync_min_interval_ms: 20000,
+                hybrid_vector_weight: 0.6,
+                hybrid_fts_weight: 0.4,
+                hybrid_candidate_multiplier: 2,
+                include_session_events: true,
+                session_events_max_results: 6,
+            },
+            embedding: {
+                enabled: false,
+                cache_enabled: true,
+                providers: [
+                    {
+                        provider: 'openai' as const,
+                        base_url: 'https://api.openai.com/v1',
+                        model: 'text-embedding-3-small',
+                        api_key: '',
+                        timeout_ms: 15000,
+                    },
+                ],
+            },
+            session_isolation: {
+                enabled: true,
+                direct_scope: 'main' as const,
+                group_scope_prefix: 'group_',
+            },
+            transcript: {
+                enabled: false,
+                max_chars_per_entry: 3000,
+            },
+        },
     },
     exec: {
         enabled: true,
@@ -286,7 +397,18 @@ export function loadConfig(): Config {
         };
         openai?: Partial<OpenAIConfig>;
         anthropic?: Partial<AnthropicConfig>;
-        agent?: Partial<AgentConfig> & { compaction?: Partial<CompactionConfig> };
+        agent?: Partial<AgentConfig> & {
+            compaction?: Partial<CompactionConfig>;
+            memory?: Partial<AgentMemoryConfig> & {
+                pgsql?: Partial<AgentMemoryPgsqlConfig>;
+                retrieval?: Partial<AgentMemoryRetrievalConfig>;
+                embedding?: Partial<AgentMemoryEmbeddingConfig> & {
+                    providers?: Array<Partial<AgentMemoryEmbeddingProviderConfig>>;
+                };
+                session_isolation?: Partial<AgentMemorySessionIsolationConfig>;
+                transcript?: Partial<AgentMemoryTranscriptConfig>;
+            };
+        };
         exec?: ExecConfigFile;
         mcp?: Partial<MCPConfig>;
         cron?: Partial<CronConfig>;
@@ -338,6 +460,28 @@ export function loadConfig(): Config {
         },
     ];
 
+    const configuredEmbeddingProviders = fileConfig.agent?.memory?.embedding?.providers;
+    const normalizedEmbeddingProviders: AgentMemoryEmbeddingProviderConfig[] =
+        Array.isArray(configuredEmbeddingProviders) && configuredEmbeddingProviders.length > 0
+            ? configuredEmbeddingProviders
+                .map((item) => {
+                    if (item.provider !== 'openai') return null;
+                    const baseUrl = item.base_url?.trim();
+                    const model = item.model?.trim();
+                    const apiKey = item.api_key?.trim();
+                    return {
+                        provider: 'openai' as const,
+                        base_url: baseUrl || DEFAULT_CONFIG.agent.memory.embedding.providers[0].base_url,
+                        model: model || DEFAULT_CONFIG.agent.memory.embedding.providers[0].model,
+                        api_key: apiKey || '',
+                        timeout_ms: item.timeout_ms && item.timeout_ms > 0
+                            ? Math.floor(item.timeout_ms)
+                            : DEFAULT_CONFIG.agent.memory.embedding.providers[0].timeout_ms,
+                    };
+                })
+                .filter((item): item is AgentMemoryEmbeddingProviderConfig => Boolean(item))
+            : [...DEFAULT_CONFIG.agent.memory.embedding.providers];
+
     const config: Config = {
         llm: {
             default_model: fileConfig.llm?.default_model
@@ -354,6 +498,31 @@ export function loadConfig(): Config {
             compaction: {
                 ...DEFAULT_CONFIG.agent.compaction,
                 ...(fileConfig.agent?.compaction || {}),
+            },
+            memory: {
+                ...DEFAULT_CONFIG.agent.memory,
+                ...(fileConfig.agent?.memory || {}),
+                pgsql: {
+                    ...DEFAULT_CONFIG.agent.memory.pgsql,
+                    ...(fileConfig.agent?.memory?.pgsql || {}),
+                },
+                retrieval: {
+                    ...DEFAULT_CONFIG.agent.memory.retrieval,
+                    ...(fileConfig.agent?.memory?.retrieval || {}),
+                },
+                embedding: {
+                    ...DEFAULT_CONFIG.agent.memory.embedding,
+                    ...(fileConfig.agent?.memory?.embedding || {}),
+                    providers: normalizedEmbeddingProviders,
+                },
+                session_isolation: {
+                    ...DEFAULT_CONFIG.agent.memory.session_isolation,
+                    ...(fileConfig.agent?.memory?.session_isolation || {}),
+                },
+                transcript: {
+                    ...DEFAULT_CONFIG.agent.memory.transcript,
+                    ...(fileConfig.agent?.memory?.transcript || {}),
+                },
             },
         },
         exec: {
@@ -492,6 +661,35 @@ export function loadConfig(): Config {
         );
     }
 
+    if (process.env.MEMORY_BACKEND) {
+        const backend = process.env.MEMORY_BACKEND.trim().toLowerCase();
+        if (backend === 'filesystem' || backend === 'pgsql') {
+            config.agent.memory.backend = backend;
+        }
+    }
+    if (process.env.MEMORY_PG_CONNECTION_STRING) {
+        config.agent.memory.pgsql.connection_string = process.env.MEMORY_PG_CONNECTION_STRING;
+        config.agent.memory.pgsql.enabled = true;
+    }
+    if (process.env.MEMORY_PG_HOST) {
+        config.agent.memory.pgsql.host = process.env.MEMORY_PG_HOST;
+    }
+    if (process.env.MEMORY_PG_PORT) {
+        const port = Number(process.env.MEMORY_PG_PORT);
+        if (Number.isFinite(port) && port > 0) {
+            config.agent.memory.pgsql.port = Math.floor(port);
+        }
+    }
+    if (process.env.MEMORY_PG_USER) {
+        config.agent.memory.pgsql.user = process.env.MEMORY_PG_USER;
+    }
+    if (process.env.MEMORY_PG_PASSWORD) {
+        config.agent.memory.pgsql.password = process.env.MEMORY_PG_PASSWORD;
+    }
+    if (process.env.MEMORY_PG_DATABASE) {
+        config.agent.memory.pgsql.database = process.env.MEMORY_PG_DATABASE;
+    }
+
     if (config.llm.models.length === 0) {
         console.error('Error: No available model configuration found in llm.models');
         process.exit(1);
@@ -535,6 +733,42 @@ export function loadConfig(): Config {
         );
         process.exit(1);
     }
+
+    if (config.agent.memory.backend === 'pgsql') {
+        config.agent.memory.pgsql.enabled = true;
+    }
+
+    const retrievalMode = config.agent.memory.retrieval.mode;
+    const validRetrievalMode: AgentMemoryRetrievalMode[] = ['keyword', 'fts', 'vector', 'hybrid'];
+    if (!validRetrievalMode.includes(retrievalMode)) {
+        config.agent.memory.retrieval.mode = DEFAULT_CONFIG.agent.memory.retrieval.mode;
+    }
+    config.agent.memory.retrieval.max_results = Math.max(1, Math.floor(config.agent.memory.retrieval.max_results));
+    config.agent.memory.retrieval.min_score = Math.max(0, Math.min(1, config.agent.memory.retrieval.min_score));
+    config.agent.memory.retrieval.sync_min_interval_ms = Math.max(1000, Math.floor(config.agent.memory.retrieval.sync_min_interval_ms));
+    config.agent.memory.retrieval.hybrid_vector_weight = Math.max(0, Math.min(1, config.agent.memory.retrieval.hybrid_vector_weight));
+    config.agent.memory.retrieval.hybrid_fts_weight = Math.max(0, Math.min(1, config.agent.memory.retrieval.hybrid_fts_weight));
+    const hybridWeightSum = config.agent.memory.retrieval.hybrid_vector_weight + config.agent.memory.retrieval.hybrid_fts_weight;
+    if (hybridWeightSum <= 0) {
+        config.agent.memory.retrieval.hybrid_vector_weight = DEFAULT_CONFIG.agent.memory.retrieval.hybrid_vector_weight;
+        config.agent.memory.retrieval.hybrid_fts_weight = DEFAULT_CONFIG.agent.memory.retrieval.hybrid_fts_weight;
+    } else {
+        config.agent.memory.retrieval.hybrid_vector_weight /= hybridWeightSum;
+        config.agent.memory.retrieval.hybrid_fts_weight /= hybridWeightSum;
+    }
+    config.agent.memory.retrieval.hybrid_candidate_multiplier = Math.max(
+        1,
+        Math.floor(config.agent.memory.retrieval.hybrid_candidate_multiplier)
+    );
+    config.agent.memory.retrieval.include_session_events = config.agent.memory.retrieval.include_session_events !== false;
+    config.agent.memory.retrieval.session_events_max_results = Math.max(
+        1,
+        Math.floor(config.agent.memory.retrieval.session_events_max_results)
+    );
+    config.agent.memory.transcript.max_chars_per_entry = Math.max(
+        200,
+        Math.floor(config.agent.memory.transcript.max_chars_per_entry)
+    );
 
     return config;
 }

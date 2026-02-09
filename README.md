@@ -21,7 +21,7 @@
 
 | 能力 | 说明 |
 |------|------|
-| 🧠 **记忆系统** | 每日记忆 / 长期记忆写入与检索，会话退出时自动 flush |
+| 🧠 **记忆系统** | PGSQL 增量索引（可回退文件模式），支持 FTS / Vector / Hybrid 检索与会话隔离 |
 | 🧹 **上下文压缩** | 自动 / 手动压缩对话历史，实时展示 Token 使用情况 |
 | 🛠️ **技能系统** | 以 `SKILL.md` 定义技能，动态加载并通过子代理协作 |
 | 🔌 **MCP 集成** | 通过 `@langchain/mcp-adapters` 挂载 MCP 工具（stdio / http / sse） |
@@ -186,6 +186,43 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
             "context_window": 128000,         // 模型上下文窗口大小
             "reserve_tokens": 20000,          // 压缩后保留的 token 数
             "max_history_share": 0.5          // 历史保留比例
+        },
+        "memory": {
+            "backend": "pgsql",               // filesystem | pgsql
+            "pgsql": {
+                "enabled": true,
+                "connection_string": "postgres://user:pass@127.0.0.1:5432/pomelobot",
+                "schema": "pomelobot_memory"
+            },
+            "retrieval": {
+                "mode": "hybrid",             // keyword | fts | vector | hybrid
+                "max_results": 8,
+                "min_score": 0.1,
+                "sync_on_search": true,
+                "sync_min_interval_ms": 20000,
+                "include_session_events": true,   // 是否把 dingtalk_session_events 纳入统一检索
+                "session_events_max_results": 6   // 每次检索最多合并多少条 session events
+            },
+            "embedding": {
+                "enabled": true,              // 关闭后自动退化为非向量检索
+                "cache_enabled": true,
+                "providers": [
+                    {
+                        "provider": "openai",
+                        "base_url": "https://api.openai.com/v1",
+                        "model": "text-embedding-3-small",
+                        "api_key": ""
+                    }
+                ]
+            },
+            "session_isolation": {
+                "enabled": true,
+                "direct_scope": "main",       // main | direct
+                "group_scope_prefix": "group_"
+            },
+            "transcript": {
+                "enabled": false
+            }
         }
     }
 }
@@ -412,8 +449,8 @@ kubectl apply -f deploy/deploy-all.yaml
 
 ## Roadmap
 
-- [ ] Memory 混合检索架构：采用 SQLite 或 Milvus + MySQL，支持语义搜索 + 关键词检索
-- [ ] 独立记忆模式：支持主会话 / 群聊的记忆隔离
+- [x] Memory 混合检索架构：PGSQL + FTS（增量索引），可选 Vector/Hybrid
+- [x] 独立记忆模式：支持主会话 / 群聊的记忆隔离（direct 可选独立 scope）
 - [ ] Sandbox 机制：沙盒环境下的命令执行（优先基于 K8s 实现）
 
 ## 许可证
