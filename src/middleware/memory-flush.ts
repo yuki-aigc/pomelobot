@@ -86,6 +86,19 @@ STEP 3: 只有在 STEP 2 完成后，才回复 "NO_REPLY"
 `;
 
 /**
+ * Build a flush prompt safe for threaded conversations.
+ * Some model providers reject non-leading system messages when thread history exists.
+ */
+export function buildMemoryFlushPrompt(): string {
+    return [
+        '[系统级要求 - 严格执行]',
+        MEMORY_FLUSH_SYSTEM_PROMPT.trim(),
+        '',
+        MEMORY_FLUSH_USER_PROMPT.trim(),
+    ].join('\n');
+}
+
+/**
  * Update token count in state
  */
 export function updateTokenCount(

@@ -1,115 +1,41 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
-
-export interface MemoryMiddlewareOptions {
-    workspacePath: string;
-}
+import type { Config } from '../config.js';
+import { resolveMemoryScope } from './memory-scope.js';
+import { getMemoryRuntime } from './memory-runtime.js';
 
 /**
- * Get today's date in YYYY-MM-DD format
- */
-function getTodayDate(): string {
-    return formatLocalDate(new Date());
-}
-
-/**
- * Get yesterday's date in YYYY-MM-DD format
- */
-function getYesterdayDate(): string {
-    const now = new Date();
-    now.setDate(now.getDate() - 1);
-    return formatLocalDate(now);
-}
-
-function formatLocalDate(date: Date): string {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-}
-
-/**
- * Load memory context for system prompt injection
+ * Load memory context for system prompt injection.
+ *
+ * To avoid cross-session leakage (main/group), memory now defaults to tool-based retrieval
+ * instead of inlining daily memory content in the static system prompt.
  */
 export function loadMemoryContext(workspacePath: string): string {
-    const memoryDir = join(workspacePath, 'memory');
-    const longTermPath = join(workspacePath, 'MEMORY.md');
-
-    let context = '';
-
-    // Load long-term memory
-    if (existsSync(longTermPath)) {
-        const content = readFileSync(longTermPath, 'utf-8').trim();
-        if (content && content !== '# Long-term Memory\n\nImportant information that persists across sessions.\n\n---') {
-            context += `### 长期记忆\n${content}\n\n`;
-        }
-    }
-
-    // Load today's memory
-    const todayPath = join(memoryDir, `${getTodayDate()}.md`);
-    if (existsSync(todayPath)) {
-        const content = readFileSync(todayPath, 'utf-8').trim();
-        if (content) {
-            context += `### 今日记忆 (${getTodayDate()})\n${content}\n\n`;
-        }
-    }
-
-    // Load yesterday's memory
-    const yesterdayPath = join(memoryDir, `${getYesterdayDate()}.md`);
-    if (existsSync(yesterdayPath)) {
-        const content = readFileSync(yesterdayPath, 'utf-8').trim();
-        if (content) {
-            context += `### 昨日记忆 (${getYesterdayDate()})\n${content}\n\n`;
-        }
-    }
-
-    return context || '暂无记忆内容。';
+    void workspacePath;
+    return [
+        '记忆采用按需检索模式。',
+        '当用户询问“你还记得吗/之前/上次/今天/昨天/我们聊过什么”等历史回溯问题时，先调用 memory_search。',
+        '若检索不足，请明确说明“已检索但信息不足”，不要臆造记忆。',
+    ].join('\n');
 }
 
 /**
  * Create memory-specific tools
  */
-export function createMemoryTools(workspacePath: string) {
-    const memoryDir = join(workspacePath, 'memory');
-    const longTermPath = join(workspacePath, 'MEMORY.md');
-
-    // Ensure memory directory exists
-    if (!existsSync(memoryDir)) {
-        mkdirSync(memoryDir, { recursive: true });
-    }
+export function createMemoryTools(workspacePath: string, config: Config) {
+    const runtimePromise = getMemoryRuntime(workspacePath, config);
 
     const memorySave = tool(
         async ({ content, target }: { content: string; target: 'daily' | 'long-term' }) => {
-            const timestamp = new Date().toLocaleTimeString('zh-CN');
-            const entry = `\n[${timestamp}] ${content}\n`;
-
-            if (target === 'daily') {
-                const dailyPath = join(memoryDir, `${getTodayDate()}.md`);
-                let existing = '';
-                if (existsSync(dailyPath)) {
-                    existing = readFileSync(dailyPath, 'utf-8');
-                } else {
-                    existing = `# Daily Memory - ${getTodayDate()}\n`;
-                }
-                writeFileSync(dailyPath, existing + entry, 'utf-8');
-                return `已保存到每日记忆: ${dailyPath}`;
-            } else {
-                let existing = '';
-                if (existsSync(longTermPath)) {
-                    existing = readFileSync(longTermPath, 'utf-8');
-                } else {
-                    existing = '# Long-term Memory\n\n';
-                }
-                writeFileSync(longTermPath, existing + entry, 'utf-8');
-                return `已保存到长期记忆: ${longTermPath}`;
-            }
+            const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+            const runtime = await runtimePromise;
+            const result = await runtime.save(content, target, scope);
+            return `已保存到记忆: ${result.path} (scope=${result.scope})`;
         },
         {
             name: 'memory_save',
-            description: '保存重要信息到记忆系统。使用 "daily" 存储今日笔记，使用 "long-term" 存储重要的持久性信息。',
+            description: '保存重要信息到记忆系统。支持按会话隔离（main/group/direct）。使用 "daily" 存储今日笔记，使用 "long-term" 存储长期信息。',
             schema: z.object({
                 content: z.string().describe('要保存的记忆内容'),
                 target: z.enum(['daily', 'long-term']).describe('目标: daily(每日记忆) 或 long-term(长期记忆)'),
@@ -119,46 +45,48 @@ export function createMemoryTools(workspacePath: string) {
 
     const memorySearch = tool(
         async ({ query }: { query: string }) => {
-            const results: string[] = [];
+            const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+            const runtime = await runtimePromise;
+            const hits = await runtime.search(query, scope);
 
-            // Search long-term memory
-            if (existsSync(longTermPath)) {
-                const content = readFileSync(longTermPath, 'utf-8');
-                const lines = content.split('\n');
-                lines.forEach((line: string, index: number) => {
-                    if (line.toLowerCase().includes(query.toLowerCase())) {
-                        results.push(`[长期记忆:${index + 1}] ${line}`);
-                    }
+            if (hits.length === 0) {
+                return `未找到与 "${query}" 相关的记忆（scope=${scope.key}）`;
+            }
+
+            const lines = hits
+                .slice(0, config.agent.memory.retrieval.max_results)
+                .map((item, index) => {
+                    const score = Number.isFinite(item.score) ? item.score.toFixed(3) : '0.000';
+                    return [
+                        `${index + 1}. [${item.path}:${item.startLine}] score=${score} source=${item.source} strategy=${item.strategy}`,
+                        `   ${item.snippet}`,
+                    ].join('\n');
                 });
-            }
 
-            // Search daily memories
-            if (existsSync(memoryDir)) {
-                const files = readdirSync(memoryDir).filter((f: string) => f.endsWith('.md'));
-                for (const file of files) {
-                    const filePath = join(memoryDir, file);
-                    const content = readFileSync(filePath, 'utf-8');
-                    const lines = content.split('\n');
-                    lines.forEach((line: string, index: number) => {
-                        if (line.toLowerCase().includes(query.toLowerCase())) {
-                            results.push(`[${file}:${index + 1}] ${line}`);
-                        }
-                    });
-                }
-            }
-
-            return results.length > 0
-                ? `找到 ${results.length} 条相关记忆:\n${results.slice(0, 20).join('\n')}`
-                : `未找到与 "${query}" 相关的记忆`;
+            return [
+                `找到 ${hits.length} 条相关记忆（scope=${scope.key}）:`,
+                ...lines,
+            ].join('\n');
         },
         {
             name: 'memory_search',
-            description: '在所有记忆文件中搜索关键词',
+            description: '在当前会话作用域的记忆中搜索（支持 keyword/fts/vector/hybrid）',
             schema: z.object({
-                query: z.string().describe('搜索关键词'),
+                query: z.string().describe('搜索关键词或语义查询'),
             }),
         }
     );
 
     return [memorySave, memorySearch];
+}
+
+export async function recordSessionTranscript(
+    workspacePath: string,
+    config: Config,
+    role: 'user' | 'assistant',
+    content: string,
+): Promise<void> {
+    const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+    const runtime = await getMemoryRuntime(workspacePath, config);
+    await runtime.appendTranscript(scope, role, content);
 }

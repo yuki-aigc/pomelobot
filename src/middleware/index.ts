@@ -1,3 +1,2 @@
-export { loadMemoryContext, createMemoryTools } from './memory.js';
+export { loadMemoryContext, createMemoryTools, recordSessionTranscript } from './memory.js';
 export * from './memory-flush.js';
-

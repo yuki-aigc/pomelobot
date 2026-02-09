@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import crypto from 'node:crypto';
+import { resolve } from 'node:path';
 
 import { createAgent } from './agent.js';
 import type { ExecApprovalPrompt, ExecApprovalRequest, ExecApprovalDecision } from './agent.js';
@@ -30,8 +31,8 @@ import {
     markFlushCompleted,
     isNoReplyResponse,
     getTokenUsageInfo,
-    MEMORY_FLUSH_SYSTEM_PROMPT,
-    MEMORY_FLUSH_USER_PROMPT,
+    buildMemoryFlushPrompt,
+    recordSessionTranscript,
     type MemoryFlushState,
 } from './middleware/index.js';
 
@@ -205,6 +206,7 @@ async function main() {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let hasConversation = false;
+    const memoryWorkspacePath = resolve(process.cwd(), config.agent.workspace);
     const appVersion = process.env.npm_package_version || '1.0.0';
 
     const getAgentConfig = () => ({
@@ -305,8 +307,7 @@ async function main() {
             const result = await agent.invoke(
                 {
                     messages: [
-                        { role: 'system', content: MEMORY_FLUSH_SYSTEM_PROMPT },
-                        { role: 'user', content: MEMORY_FLUSH_USER_PROMPT },
+                        { role: 'user', content: buildMemoryFlushPrompt() },
                     ],
                 },
                 {
@@ -493,6 +494,8 @@ async function main() {
             hasConversation = true;
             flushState = updateTokenCount(flushState, userInput);
             totalInputTokens += estimateTokens(userInput);
+            await recordSessionTranscript(memoryWorkspacePath, config, 'user', userInput)
+                .catch(() => undefined);
 
             // Check auto-compact before processing
             await executeAutoCompact();
@@ -557,6 +560,8 @@ async function main() {
                 // Update token count and message history
                 flushState = updateTokenCount(flushState, fullResponse);
                 totalOutputTokens += estimateTokens(fullResponse);
+                await recordSessionTranscript(memoryWorkspacePath, config, 'assistant', fullResponse)
+                    .catch(() => undefined);
                 lastUpdatedAt = new Date();
                 const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
                 messageHistory.push(new HumanMessage(userInput));
