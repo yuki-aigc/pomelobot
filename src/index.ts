@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import crypto from 'node:crypto';
+import { resolve } from 'node:path';
 
 import { createAgent } from './agent.js';
 import type { ExecApprovalPrompt, ExecApprovalRequest, ExecApprovalDecision } from './agent.js';
@@ -30,8 +31,8 @@ import {
     markFlushCompleted,
     isNoReplyResponse,
     getTokenUsageInfo,
-    MEMORY_FLUSH_SYSTEM_PROMPT,
-    MEMORY_FLUSH_USER_PROMPT,
+    buildMemoryFlushPrompt,
+    recordSessionTranscript,
     type MemoryFlushState,
 } from './middleware/index.js';
 
@@ -205,6 +206,7 @@ async function main() {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let hasConversation = false;
+    const memoryWorkspacePath = resolve(process.cwd(), config.agent.workspace);
     const appVersion = process.env.npm_package_version || '1.0.0';
 
     const getAgentConfig = () => ({
@@ -297,15 +299,15 @@ async function main() {
     /**
      * Execute memory flush - save conversation summary to memory file
      */
-    async function executeMemoryFlush(): Promise<void> {
+    async function executeMemoryFlush(options?: { preserveTokenCount?: boolean }): Promise<void> {
         process.stdout.write(`${colors.gray}● ${colors.reset}${colors.dim}Saving memory...${colors.reset}`);
+        const tokensBeforeFlush = flushState.totalTokens;
 
         try {
             const result = await agent.invoke(
                 {
                     messages: [
-                        { role: 'system', content: MEMORY_FLUSH_SYSTEM_PROMPT },
-                        { role: 'user', content: MEMORY_FLUSH_USER_PROMPT },
+                        { role: 'user', content: buildMemoryFlushPrompt() },
                     ],
                 },
                 {
@@ -323,6 +325,13 @@ async function main() {
             }
 
             flushState = markFlushCompleted(flushState);
+            if (options?.preserveTokenCount) {
+                flushState = {
+                    ...flushState,
+                    totalTokens: tokensBeforeFlush,
+                    lastFlushTokens: tokensBeforeFlush,
+                };
+            }
         } catch (error) {
             process.stdout.write(` ${colors.red}✗${colors.reset}\n`);
             console.error(`${colors.red}Error during memory flush:${colors.reset}`, error instanceof Error ? error.message : error);
@@ -333,13 +342,15 @@ async function main() {
      * Execute auto-compaction if needed (with memory flush first)
      */
     async function executeAutoCompact(): Promise<void> {
-        if (!shouldAutoCompact(flushState.totalTokens, config.agent.compaction)) {
-            return;
-        }
+        const tokensBeforeAutoCompact = flushState.totalTokens;
 
         // First: flush memory to save important info
         if (shouldTriggerMemoryFlush(flushState, config.agent.compaction)) {
-            await executeMemoryFlush();
+            await executeMemoryFlush({ preserveTokenCount: true });
+        }
+
+        if (!shouldAutoCompact(tokensBeforeAutoCompact, config.agent.compaction)) {
+            return;
         }
 
         // Then: compact context
@@ -351,6 +362,7 @@ async function main() {
 
             messageHistory = result.messages;
             flushState = markFlushCompleted(flushState);
+            flushState = { ...flushState, totalTokens: result.tokensAfter };
 
             const saved = result.tokensBefore - result.tokensAfter;
             process.stdout.write(` ${colors.green}✓${colors.reset} (${formatTokenCount(saved)} saved)\n`);
@@ -454,6 +466,7 @@ async function main() {
                             );
                             messageHistory = compactResult.messages;
                             flushState = markFlushCompleted(flushState);
+                            flushState = { ...flushState, totalTokens: compactResult.tokensAfter };
 
                             const saved = compactResult.tokensBefore - compactResult.tokensAfter;
                             responseText = saved > 0
@@ -481,6 +494,8 @@ async function main() {
             hasConversation = true;
             flushState = updateTokenCount(flushState, userInput);
             totalInputTokens += estimateTokens(userInput);
+            await recordSessionTranscript(memoryWorkspacePath, config, 'user', userInput)
+                .catch(() => undefined);
 
             // Check auto-compact before processing
             await executeAutoCompact();
@@ -545,6 +560,8 @@ async function main() {
                 // Update token count and message history
                 flushState = updateTokenCount(flushState, fullResponse);
                 totalOutputTokens += estimateTokens(fullResponse);
+                await recordSessionTranscript(memoryWorkspacePath, config, 'assistant', fullResponse)
+                    .catch(() => undefined);
                 lastUpdatedAt = new Date();
                 const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
                 messageHistory.push(new HumanMessage(userInput));

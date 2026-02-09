@@ -33,6 +33,54 @@
             "context_window": 128000,
             "reserve_tokens": 20000,
             "max_history_share": 0.5
+        },
+        "memory": {
+            "backend": "pgsql",
+            "pgsql": {
+                "enabled": true,
+                "connection_string": "",
+                "host": "127.0.0.1",
+                "port": 5432,
+                "user": "pomelobot",
+                "password": "Admin@123",
+                "database": "pomelobot",
+                "ssl": false,
+                "schema": "pomelobot_memory"
+            },
+            "retrieval": {
+                "mode": "hybrid",
+                "max_results": 8,
+                "min_score": 0.1,
+                "sync_on_search": true,
+                "sync_min_interval_ms": 20000,
+                "hybrid_vector_weight": 0.6,
+                "hybrid_fts_weight": 0.4,
+                "hybrid_candidate_multiplier": 2,
+                "include_session_events": true,
+                "session_events_max_results": 6
+            },
+            "embedding": {
+                "enabled": true,
+                "cache_enabled": true,
+                "providers": [
+                    {
+                        "provider": "openai",
+                        "base_url": "https://api.openai.com/v1",
+                        "model": "text-embedding-3-small",
+                        "api_key": "",
+                        "timeout_ms": 15000
+                    }
+                ]
+            },
+            "session_isolation": {
+                "enabled": true,
+                "direct_scope": "main",
+                "group_scope_prefix": "group_"
+            },
+            "transcript": {
+                "enabled": false,
+                "max_chars_per_entry": 3000
+            }
         }
     },
     "exec": {

@@ -3,7 +3,6 @@
  * Handles incoming messages and agent interaction
  */
 
-import crypto from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promises as fsPromises } from 'node:fs';
 import path from 'node:path';
@@ -38,8 +37,8 @@ import {
     shouldTriggerMemoryFlush,
     markFlushCompleted,
     isNoReplyResponse,
-    MEMORY_FLUSH_SYSTEM_PROMPT,
-    MEMORY_FLUSH_USER_PROMPT,
+    buildMemoryFlushPrompt,
+    recordSessionTranscript,
     type MemoryFlushState,
 } from '../../middleware/index.js';
 import {
@@ -58,18 +57,27 @@ import {
     listConfiguredModels,
 } from '../../llm.js';
 import { HumanMessage as LCHumanMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import { withDingTalkConversationContext } from './context.js';
+import { resolveMemoryScope } from '../../middleware/memory-scope.js';
+import { DingTalkSessionStore, buildStableThreadId } from './session-store.js';
 
-// Session state cache (conversationId -> SessionState)
+// Session state cache (scopeKey -> SessionState)
 const sessionCache = new Map<string, SessionState>();
 let cachedCompactionModel: BaseChatModel | null = null;
 let cachedCompactionModelKey = '';
+let sessionStore: DingTalkSessionStore | null = null;
+let sessionStoreConfigKey = '';
+let sessionStoreInitPromise: Promise<DingTalkSessionStore | null> | null = null;
+let lastSessionStoreCleanupAt = 0;
+const hydratedThreadIds = new Set<string>();
 
 // Per-conversation processing queue to ensure serial handling
 const conversationQueue = new Map<string, Promise<void>>();
 
 // Session TTL (2 hours)
 const SESSION_TTL = 2 * 60 * 60 * 1000;
+const SESSION_STORE_CLEANUP_INTERVAL = 10 * 60 * 1000;
 const MAX_TEXT_FILE_BYTES = 256 * 1024;
 const MAX_TEXT_FILE_CHARS = 6000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -82,6 +90,13 @@ const DINGTALK_FILE_TAG_PATTERN = /<dingtalk-file\s+path=(?:"([^"]+)"|'([^']+)')
 const FILE_OUTPUT_LINE_PATTERN = /^FILE_OUTPUT:\s*(.+)$/gim;
 const USER_FILE_TRANSFER_INTENT_PATTERN = /(回传|发送|发我|发给我|传给我|给我|下载|附件|文件)/;
 const WORKSPACE_PATH_HINT_PATTERN = /(^|[\s"'`(（\[])(\.?\/?workspace\/[^\s"'`)\]）>]+)/g;
+const MINIMAX_TOOL_CALL_TAG_PATTERN = /<\s*minimax:tool_call\b[\s\S]*?(?:<\/\s*minimax:tool_call\s*>|$)/gi;
+const MINIMAX_TOOL_CALL_CLOSE_TAG_PATTERN = /<\/\s*minimax:tool_call\s*>/gi;
+const GENERIC_TOOL_CALL_TAG_PATTERN = /<\s*\/?\s*tool_call\b[^>]*>/gi;
+const TOOL_CALL_HINT_PATTERN = /\[\s*调用工具:[^\]\n]*\]/g;
+const TOOL_CALL_INLINE_NAME_PATTERN = /\[\s*调用\s+name=["'][^"']+["'][^\]\n]*\]/g;
+const TOOL_CALL_TRAIL_PATTERN = /\[\s*调用(?:工具|参数)?:[^\n]*/g;
+const TOOL_CALL_RESIDUE_PATTERN = /(调用工具|调用参数|tool_call|minimax:tool_call|^\s*调用\s+name=|^\s*name\s*=\s*["'])/i;
 
 const TEXT_MIME_HINTS = [
     'text/',
@@ -167,14 +182,32 @@ export function extractMessageContent(data: DingTalkInboundMessage): MessageCont
 /**
  * Get or create session state for a conversation
  */
-function getOrCreateSession(conversationId: string): SessionState {
-    const existing = sessionCache.get(conversationId);
+async function getOrCreateSession(params: {
+    sessionKey: string;
+    scopeKey: string;
+    store: DingTalkSessionStore | null;
+    log: Logger;
+}): Promise<SessionState> {
+    const { sessionKey, scopeKey, store, log } = params;
+    const existing = sessionCache.get(sessionKey);
     if (existing && Date.now() - existing.lastUpdated < SESSION_TTL) {
         return existing;
     }
 
+    if (store) {
+        try {
+            const persisted = await store.load(sessionKey);
+            if (persisted && Date.now() - persisted.lastUpdated < SESSION_TTL) {
+                sessionCache.set(sessionKey, persisted);
+                return persisted;
+            }
+        } catch (error) {
+            log.warn(`[DingTalk] Failed to load persisted session for ${sessionKey}: ${String(error)}`);
+        }
+    }
+
     const newSession: SessionState = {
-        threadId: `dingtalk-${conversationId}-${crypto.randomUUID().slice(0, 8)}`,
+        threadId: buildStableThreadId(scopeKey),
         messageHistory: [],
         totalTokens: 0,
         totalInputTokens: 0,
@@ -182,20 +215,159 @@ function getOrCreateSession(conversationId: string): SessionState {
         compactionCount: 0,
         lastUpdated: Date.now(),
     };
-    sessionCache.set(conversationId, newSession);
+    sessionCache.set(sessionKey, newSession);
+
+    if (store) {
+        try {
+            await store.save({ sessionKey, scopeKey, session: newSession });
+        } catch (error) {
+            log.warn(`[DingTalk] Failed to persist new session ${sessionKey}: ${String(error)}`);
+        }
+    }
+
     return newSession;
 }
 
 /**
  * Clean up expired sessions
  */
-function cleanupSessions(): void {
+async function cleanupSessions(
+    store: DingTalkSessionStore | null,
+    log: Logger
+): Promise<void> {
     const now = Date.now();
     for (const [id, session] of sessionCache.entries()) {
         if (now - session.lastUpdated > SESSION_TTL) {
             sessionCache.delete(id);
+            hydratedThreadIds.delete(session.threadId);
         }
     }
+
+    if (!store) {
+        return;
+    }
+    if (now - lastSessionStoreCleanupAt < SESSION_STORE_CLEANUP_INTERVAL) {
+        return;
+    }
+
+    lastSessionStoreCleanupAt = now;
+    try {
+        const deleted = await store.deleteExpired(now - SESSION_TTL);
+        if (deleted > 0) {
+            log.info(`[DingTalk] Cleaned ${deleted} expired persisted sessions`);
+        }
+    } catch (error) {
+        log.warn(`[DingTalk] Persisted session cleanup failed: ${String(error)}`);
+    }
+}
+
+function getSessionStoreConfigKey(config: Config): string {
+    const memory = config.agent.memory;
+    const pg = memory.pgsql;
+    return JSON.stringify({
+        backend: memory.backend,
+        enabled: pg.enabled,
+        connection_string: pg.connection_string || '',
+        host: pg.host || '',
+        port: pg.port,
+        user: pg.user || '',
+        database: pg.database || '',
+        ssl: pg.ssl,
+        schema: pg.schema || 'pomelobot_memory',
+    });
+}
+
+async function getSessionStore(config: Config, log: Logger): Promise<DingTalkSessionStore | null> {
+    const key = getSessionStoreConfigKey(config);
+    if (sessionStore && sessionStoreConfigKey === key) {
+        return sessionStore;
+    }
+
+    if (sessionStoreInitPromise && sessionStoreConfigKey === key) {
+        return sessionStoreInitPromise;
+    }
+
+    if (sessionStore && sessionStoreConfigKey !== key) {
+        await sessionStore.close().catch(() => undefined);
+        sessionStore = null;
+    }
+
+    sessionStoreConfigKey = key;
+    sessionStoreInitPromise = (async () => {
+        const store = new DingTalkSessionStore(config, log);
+        const initialized = await store.initialize();
+        if (!initialized) {
+            await store.close().catch(() => undefined);
+            return null;
+        }
+        sessionStore = store;
+        return store;
+    })().finally(() => {
+        sessionStoreInitPromise = null;
+    });
+
+    return sessionStoreInitPromise;
+}
+
+async function persistSession(params: {
+    sessionKey: string;
+    scopeKey: string;
+    session: SessionState;
+    store: DingTalkSessionStore | null;
+    log: Logger;
+}): Promise<void> {
+    if (!params.store) {
+        return;
+    }
+    try {
+        await params.store.save({
+            sessionKey: params.sessionKey,
+            scopeKey: params.scopeKey,
+            session: params.session,
+        });
+    } catch (error) {
+        params.log.warn(`[DingTalk] Failed to persist session ${params.sessionKey}: ${String(error)}`);
+    }
+}
+
+async function persistSessionEvent(params: {
+    role: 'user' | 'assistant' | 'summary';
+    content: string;
+    conversationId: string;
+    sessionKey: string;
+    store: DingTalkSessionStore | null;
+    workspacePath: string;
+    config: Config;
+    log: Logger;
+    metadata?: Record<string, unknown>;
+}): Promise<void> {
+    const text = params.content.trim();
+    if (!text) {
+        return;
+    }
+
+    if (params.store) {
+        await params.store.appendEvent({
+            sessionKey: params.sessionKey,
+            conversationId: params.conversationId,
+            role: params.role,
+            content: text,
+            metadata: params.metadata,
+        }).catch((error) => {
+            params.log.warn(`[DingTalk] Failed to persist session event (${params.role}): ${String(error)}`);
+        });
+        return;
+    }
+
+    if (params.role === 'summary') {
+        await recordSessionTranscript(params.workspacePath, params.config, 'assistant', `[压缩摘要] ${text}`)
+            .catch((error) => params.log.debug('[DingTalk] Transcript(summary) write skipped:', String(error)));
+        return;
+    }
+
+    const fallbackRole = params.role === 'assistant' ? 'assistant' : 'user';
+    await recordSessionTranscript(params.workspacePath, params.config, fallbackRole, text)
+        .catch((error) => params.log.debug(`[DingTalk] Transcript(${fallbackRole}) write skipped:`, String(error)));
 }
 
 /**
@@ -257,6 +429,80 @@ function buildDingTalkAgentMessages(userText: string): Array<{ role: 'user'; con
     ];
 }
 
+function normalizeHistoryContent(content: unknown): string {
+    if (typeof content === 'string') {
+        return content.trim();
+    }
+
+    if (Array.isArray(content)) {
+        const chunks: string[] = [];
+        for (const item of content) {
+            if (typeof item === 'string') {
+                chunks.push(item);
+                continue;
+            }
+            if (!item || typeof item !== 'object') {
+                continue;
+            }
+            const text = (item as { text?: unknown }).text;
+            if (typeof text === 'string') {
+                chunks.push(text);
+            }
+        }
+        return chunks.join('\n').trim();
+    }
+
+    if (content === null || content === undefined) {
+        return '';
+    }
+
+    try {
+        return JSON.stringify(content);
+    } catch {
+        return String(content);
+    }
+}
+
+function toAgentHistoryMessage(message: BaseMessage): { role: 'system' | 'assistant' | 'user'; content: string } | null {
+    const content = normalizeHistoryContent(message.content);
+    if (!content) {
+        return null;
+    }
+
+    switch (message._getType()) {
+    case 'system':
+        return { role: 'system', content };
+    case 'ai':
+        return { role: 'assistant', content };
+    case 'human':
+        return { role: 'user', content };
+    default:
+        return null;
+    }
+}
+
+function buildAgentInvocationMessages(
+    session: SessionState,
+    userText: string
+): Array<{ role: 'system' | 'assistant' | 'user'; content: string }> {
+    if (hydratedThreadIds.has(session.threadId)) {
+        return buildDingTalkAgentMessages(userText);
+    }
+
+    const history = session.messageHistory
+        .map((message) => toAgentHistoryMessage(message))
+        .filter((item): item is { role: 'system' | 'assistant' | 'user'; content: string } => Boolean(item));
+
+    if (history.length === 0) {
+        return buildDingTalkAgentMessages(userText);
+    }
+
+    return [
+        ...history,
+        ...buildDingTalkAgentMessages(userText),
+    ];
+}
+
 function cleanPotentialFilePath(raw: string): string {
     const trimmed = raw
         .trim()
@@ -280,6 +526,237 @@ function collectWorkspacePathHints(text: string): string[] {
     return paths;
 }
 
+function sanitizeAssistantReplyText(text: string): string {
+    if (!text) return '';
+    let cleaned = text;
+    cleaned = cleaned.replace(MINIMAX_TOOL_CALL_TAG_PATTERN, '');
+    cleaned = cleaned.replace(MINIMAX_TOOL_CALL_CLOSE_TAG_PATTERN, '');
+    cleaned = cleaned.replace(GENERIC_TOOL_CALL_TAG_PATTERN, '');
+    cleaned = cleaned.replace(TOOL_CALL_HINT_PATTERN, '');
+    cleaned = cleaned.replace(TOOL_CALL_INLINE_NAME_PATTERN, '');
+    cleaned = cleaned.replace(TOOL_CALL_TRAIL_PATTERN, '');
+    cleaned = cleaned
+        .split('\n')
+        .filter((line) => !TOOL_CALL_RESIDUE_PATTERN.test(line.trim()))
+        .join('\n');
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+    return cleaned.trim();
+}
+
+function extractTextBlocks(content: unknown): string {
+    if (typeof content === 'string') {
+        return content.trim();
+    }
+    if (content && typeof content === 'object' && !Array.isArray(content)) {
+        const obj = content as {
+            text?: unknown;
+            content?: unknown;
+            kwargs?: { text?: unknown; content?: unknown };
+        };
+        if (typeof obj.text === 'string' && obj.text.trim()) {
+            return obj.text.trim();
+        }
+        if (obj.content !== undefined) {
+            return extractTextBlocks(obj.content);
+        }
+        if (obj.kwargs) {
+            if (obj.kwargs.content !== undefined) {
+                return extractTextBlocks(obj.kwargs.content);
+            }
+            if (obj.kwargs.text !== undefined) {
+                return extractTextBlocks(obj.kwargs.text);
+            }
+        }
+        return '';
+    }
+    if (!Array.isArray(content)) {
+        return '';
+    }
+    const blocks: string[] = [];
+    for (const item of content) {
+        if (typeof item === 'string') {
+            blocks.push(item);
+            continue;
+        }
+        if (!item || typeof item !== 'object') {
+            continue;
+        }
+        const text = (item as { text?: unknown }).text;
+        if (typeof text === 'string' && text.trim()) {
+            blocks.push(text);
+        }
+    }
+    return blocks.join('\n').trim();
+}
+
+function extractReplyTextFromEventData(data: unknown, depth: number = 0): string {
+    if (!data || depth > 3) {
+        return '';
+    }
+    if (typeof data === 'string' || Array.isArray(data)) {
+        return extractTextBlocks(data);
+    }
+    if (typeof data !== 'object') {
+        return '';
+    }
+
+    const record = data as Record<string, unknown> & { kwargs?: { content?: unknown; output?: unknown; messages?: unknown } };
+    const directContent = extractTextBlocks(record.content !== undefined ? record.content : record.kwargs?.content);
+    if (directContent) {
+        return directContent;
+    }
+
+    const messages = Array.isArray(record.messages)
+        ? record.messages
+        : Array.isArray(record.kwargs?.messages)
+            ? record.kwargs.messages
+            : null;
+    if (messages && messages.length > 0) {
+        const lastMessage = messages[messages.length - 1] as { content?: unknown } | undefined;
+        if (lastMessage) {
+            const messageContent = extractTextBlocks(lastMessage.content);
+            if (messageContent) {
+                return messageContent;
+            }
+        }
+    }
+
+    if ('output' in record) {
+        return extractReplyTextFromEventData(record.output, depth + 1);
+    }
+    if (record.kwargs && 'output' in record.kwargs) {
+        return extractReplyTextFromEventData(record.kwargs.output, depth + 1);
+    }
+    return '';
+}
+
+function getMessageRole(message: unknown): string {
+    if (!message || typeof message !== 'object') {
+        return '';
+    }
+    const msg = message as {
+        _getType?: unknown;
+        type?: unknown;
+        role?: unknown;
+        kwargs?: { type?: unknown; role?: unknown };
+    };
+    if (typeof msg._getType === 'function') {
+        try {
+            const role = (msg._getType as () => string)();
+            if (typeof role === 'string') {
+                return role.toLowerCase();
+            }
+        } catch {
+            // ignore
+        }
+    }
+    if (typeof msg.type === 'string' && msg.type.trim()) {
+        return msg.type.toLowerCase();
+    }
+    if (typeof msg.role === 'string' && msg.role.trim()) {
+        return msg.role.toLowerCase();
+    }
+    if (msg.kwargs) {
+        if (typeof msg.kwargs.type === 'string' && msg.kwargs.type.trim()) {
+            return msg.kwargs.type.toLowerCase();
+        }
+        if (typeof msg.kwargs.role === 'string' && msg.kwargs.role.trim()) {
+            return msg.kwargs.role.toLowerCase();
+        }
+    }
+    return '';
+}
+
+function isLikelyToolCallResidue(text: string): boolean {
+    const cleaned = sanitizeAssistantReplyText(text);
+    if (!cleaned) return true;
+    if (TOOL_CALL_RESIDUE_PATTERN.test(cleaned)) return true;
+    if (/(minimax:tool_call|tool_call)/i.test(cleaned)) return true;
+    if (/^[\s\]\[}{(),.:;'"`\\/-]+$/.test(cleaned)) return true;
+    const total = cleaned.length;
+    const readable = (cleaned.match(/[A-Za-z0-9\u4e00-\u9fa5]/g) || []).length;
+    const braces = (cleaned.match(/[{}\[\]]/g) || []).length;
+    if (total >= 40 && readable / total < 0.15 && braces / total > 0.3) {
+        return true;
+    }
+    return false;
+}
+
+function isLikelyStructuredToolPayload(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+
+    const fenced = trimmed.match(/^```(?:json|javascript|js)?\s*([\s\S]*?)\s*```$/i);
+    const body = (fenced?.[1] || trimmed).trim();
+    if (!body) return false;
+    if (!(body.startsWith('{') || body.startsWith('['))) {
+        return false;
+    }
+
+    const compact = body.replace(/\s+/g, ' ');
+    const kvLike = (compact.match(/":/g) || []).length;
+    const objLike = (compact.match(/,\s*"/g) || []).length;
+    const weatherLike = /(forecasts?|dayweather|nightweather|daytemp|nighttemp|temperature|humidity|wind|province|city|adcode)/i.test(compact);
+
+    return kvLike >= 4 || objLike >= 4 || weatherLike;
+}
+
+function extractBestReadableReplyFromMessages(messages: unknown[]): string {
+    let fallback = '';
+
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const message = messages[i];
+        if (!message || typeof message !== 'object') {
+            continue;
+        }
+        const role = getMessageRole(message);
+        const msg = message as { content?: unknown; kwargs?: { content?: unknown } };
+        const content = extractTextBlocks(msg.content !== undefined ? msg.content : msg.kwargs?.content);
+        const cleaned = sanitizeAssistantReplyText(content);
+        if (!cleaned) {
+            continue;
+        }
+        if (!fallback) {
+            fallback = cleaned;
+        }
+        if ((role === 'ai' || role === 'assistant') && !isLikelyToolCallResidue(cleaned)) {
+            return cleaned;
+        }
+    }
+
+    if (fallback && !isLikelyToolCallResidue(fallback)) {
+        return fallback;
+    }
+    return '';
+}
+
+function pickBestUserFacingResponse(
+    candidates: string[],
+    options?: {
+        sawToolCall?: boolean;
+    }
+): string {
+    const sawToolCall = options?.sawToolCall === true;
+    let fallback = '';
+    for (const candidate of candidates) {
+        const cleaned = sanitizeAssistantReplyText(candidate);
+        if (!cleaned) {
+            continue;
+        }
+        if (isLikelyToolCallResidue(cleaned)) {
+            continue;
+        }
+        if (!fallback) {
+            fallback = cleaned;
+        }
+        if (sawToolCall && isLikelyStructuredToolPayload(cleaned)) {
+            continue;
+        }
+        return cleaned;
+    }
+    return fallback;
+}
+
 function collectReplyPathHints(text: string): { cleanedText: string; candidates: string[] } {
     const candidates: string[] = [];
     DINGTALK_FILE_TAG_PATTERN.lastIndex = 0;
@@ -301,9 +778,9 @@ function collectReplyPathHints(text: string): { cleanedText: string; candidates:
         return '';
     });
 
-    cleanedText = cleanedText.replace(/\n{3,}/g, '\n\n').trim();
+    cleanedText = sanitizeAssistantReplyText(cleanedText);
     return {
-        cleanedText: cleanedText || text.trim(),
+        cleanedText: cleanedText || sanitizeAssistantReplyText(text),
         candidates,
     };
 }
@@ -1020,9 +1497,10 @@ async function handleMessageInternal(
     ctx: MessageHandlerContext
 ): Promise<void> {
     const { config, dingtalkConfig, log } = ctx;
+    const persistedSessionStore = await getSessionStore(config, log);
 
     // Clean up expired sessions periodically
-    cleanupSessions();
+    await cleanupSessions(persistedSessionStore, log);
     cleanupCardCache();
 
     // Ignore bot self-messages
@@ -1042,9 +1520,15 @@ async function handleMessageInternal(
     const senderId = data.senderStaffId || data.senderId;
     const senderName = data.senderNick || 'Unknown';
     const conversationId = data.conversationId;
+    const scope = resolveMemoryScope(config.agent.memory.session_isolation);
 
     // Get or create session for this conversation
-    const session = getOrCreateSession(conversationId);
+    const session = await getOrCreateSession({
+        sessionKey: scope.key,
+        scopeKey: scope.key,
+        store: persistedSessionStore,
+        log,
+    });
 
     const handledModelCommand = await tryHandleSlashCommand({
         text: content.text,
@@ -1127,13 +1611,39 @@ async function handleMessageInternal(
     // Update token count with user input
     flushState = updateTokenCount(flushState, content.text);
     session.totalInputTokens += estimateTokens(content.text);
+    const memoryWorkspacePath = path.resolve(process.cwd(), config.agent.workspace);
+    await persistSessionEvent({
+        role: 'user',
+        content: content.text,
+        conversationId,
+        sessionKey: scope.key,
+        store: persistedSessionStore,
+        workspacePath: memoryWorkspacePath,
+        config,
+        log,
+    });
 
     // Reuse shared compaction model
     const compactionModel = await getCompactionModel(config);
     const compactionConfig = config.agent.compaction;
 
     // Check if we need auto-compaction before processing
-    await executeAutoCompact(ctx.agent, session, flushState, compactionModel, compactionConfig, log);
+    flushState = await executeAutoCompact(
+        ctx.agent,
+        session,
+        flushState,
+        compactionModel,
+        compactionConfig,
+        log,
+        {
+            store: persistedSessionStore,
+            sessionKey: scope.key,
+            conversationId,
+            workspacePath: memoryWorkspacePath,
+            config,
+        }
+    );
+    session.totalTokens = flushState.totalTokens;
 
     // Determine message mode
     const useCardMode = dingtalkConfig.messageType === 'card';
@@ -1179,6 +1689,7 @@ async function handleMessageInternal(
 
     try {
         // Invoke agent with streaming for card mode
+        const invocationMessages = buildAgentInvocationMessages(session, content.text);
         const agentConfig = {
             configurable: { thread_id: session.threadId },
             recursionLimit: config.agent.recursion_limit,
@@ -1187,8 +1698,12 @@ async function handleMessageInternal(
         log.debug(`[DingTalk] Invoking agent with thread_id: ${session.threadId}`);
 
         let fullResponse = '';
+        let rawStreamResponse = '';
+        let finalOutputFromEvents = '';
+        let lastToolOutputFromEvents = '';
+        let sawToolCall = false;
         let responseFiles: string[] = [];
-        const workspaceRoot = path.resolve(process.cwd(), config.agent.workspace);
+        const workspaceRoot = memoryWorkspacePath;
         const requestedFilesFromUser = await collectRequestedFilesFromUser({
             userText: content.text,
             workspaceRoot,
@@ -1203,7 +1718,7 @@ async function handleMessageInternal(
             log.info('[DingTalk] Starting streamEvents...');
 
             const eventStream = ctx.agent.streamEvents(
-                { messages: buildDingTalkAgentMessages(content.text) },
+                { messages: invocationMessages },
                 { ...agentConfig, version: 'v2' }
             );
 
@@ -1262,6 +1777,16 @@ async function handleMessageInternal(
                 }, delay);
             };
 
+            const waitForStreamDrain = async (timeoutMs: number) => {
+                const start = Date.now();
+                while (Date.now() - start < timeoutMs) {
+                    if (!flushInFlight && !pendingFlush && !flushQueuedFinal) {
+                        return;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                }
+            };
+
             for await (const event of eventStream) {
                 eventCount++;
                 if (eventCount <= 3 || eventCount % 10 === 0) {
@@ -1282,16 +1807,62 @@ async function handleMessageInternal(
                             }
                         }
 
-                        fullResponse += text;
+                        rawStreamResponse += text;
+                        const cleanedCandidate = sanitizeAssistantReplyText(rawStreamResponse);
+                        const shouldSuppressStreamCandidate = sawToolCall && (
+                            isLikelyToolCallResidue(cleanedCandidate) || isLikelyStructuredToolPayload(cleanedCandidate)
+                        );
+                        if (!shouldSuppressStreamCandidate) {
+                            fullResponse = cleanedCandidate;
+                        }
 
                         // Throttle stream updates to avoid rate limiting
                         scheduleFlush(false);
                     }
                 } else if (event.event === 'on_tool_start') {
                     const toolName = event.name;
+                    sawToolCall = true;
                     log.info(`[DingTalk] Tool started: ${toolName}`);
-                    fullResponse += `\n[调用工具: ${toolName}]\n`;
-                    scheduleFlush(false);
+                } else if (event.event === 'on_tool_end') {
+                    const toolOutput = sanitizeAssistantReplyText(extractReplyTextFromEventData(event.data));
+                    if (toolOutput) {
+                        lastToolOutputFromEvents = toolOutput;
+                    }
+                } else if (event.event === 'on_chat_model_end' || event.event === 'on_chain_end') {
+                    const extracted = sanitizeAssistantReplyText(extractReplyTextFromEventData(event.data));
+                    if (extracted && !isLikelyToolCallResidue(extracted) && !isLikelyStructuredToolPayload(extracted)) {
+                        finalOutputFromEvents = extracted;
+                    }
+                    const eventData = event.data as { output?: { messages?: unknown[] }; messages?: unknown[] } | undefined;
+                    const outputMessages = Array.isArray(eventData?.output?.messages)
+                        ? eventData.output.messages
+                        : Array.isArray(eventData?.messages)
+                            ? eventData.messages
+                            : null;
+                    if (outputMessages) {
+                        const bestFromMessages = extractBestReadableReplyFromMessages(outputMessages);
+                        if (bestFromMessages) {
+                            finalOutputFromEvents = bestFromMessages;
+                        }
+                    }
+                }
+            }
+
+            fullResponse = pickBestUserFacingResponse([
+                finalOutputFromEvents,
+                fullResponse,
+                rawStreamResponse,
+            ], {
+                sawToolCall,
+            });
+            if (!fullResponse) {
+                log.warn(
+                    `[DingTalk] Stream reply did not produce user-facing text. ` +
+                    `tool_called=${sawToolCall} raw_len=${rawStreamResponse.length} ` +
+                    `chain_len=${finalOutputFromEvents.length} tool_len=${lastToolOutputFromEvents.length}`
+                );
+                if (sawToolCall) {
+                    fullResponse = '我已完成工具查询，但结果整理失败。请让我重试一次，我会给你结构化结论。';
                 }
             }
 
@@ -1316,12 +1887,17 @@ async function handleMessageInternal(
                     pendingFlush = null;
                 }
                 await flushNow(true);
+                await waitForStreamDrain(2500);
 
                 const cardState = currentCard.state as AICardState;
-                if (streamFlushError || cardState !== AICardStatus.FINISHED) {
+                if (streamFlushError || cardState === AICardStatus.FAILED) {
                     shouldFallbackToSessionMessage = true;
                     log.warn(
                         `[DingTalk] Card finalization incomplete (state=${cardState}), falling back to session markdown reply`
+                    );
+                } else if (cardState !== AICardStatus.FINISHED) {
+                    log.warn(
+                        `[DingTalk] Card finalization state still ${cardState}; skip markdown fallback to avoid duplicate reply`
                     );
                 } else {
                     log.info('[DingTalk] AI Card finalized successfully');
@@ -1347,7 +1923,7 @@ async function handleMessageInternal(
         } else {
             // Markdown mode: use invoke
             const result = await ctx.agent.invoke(
-                { messages: buildDingTalkAgentMessages(content.text) },
+                { messages: invocationMessages },
                 agentConfig
             );
 
@@ -1359,6 +1935,10 @@ async function handleMessageInternal(
                     ? lastMessage.content
                     : JSON.stringify(lastMessage.content);
             }
+            fullResponse = pickBestUserFacingResponse([
+                fullResponse,
+                Array.isArray(messages) ? extractBestReadableReplyFromMessages(messages) : '',
+            ]);
 
             if (!fullResponse) {
                 fullResponse = '抱歉，我没有生成有效的回复。';
@@ -1398,10 +1978,21 @@ async function handleMessageInternal(
             filePaths: mergeFilePaths([...requestedFilesFromUser, ...responseFiles]),
             log,
         });
+        hydratedThreadIds.add(session.threadId);
 
         // Update token count and message history
         flushState = updateTokenCount(flushState, fullResponse);
         session.totalOutputTokens += estimateTokens(fullResponse);
+        await persistSessionEvent({
+            role: 'assistant',
+            content: fullResponse,
+            conversationId,
+            sessionKey: scope.key,
+            store: persistedSessionStore,
+            workspacePath: memoryWorkspacePath,
+            config,
+            log,
+        });
         const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
         session.messageHistory.push(new HumanMessage(content.text));
         session.messageHistory.push(new AIMessage(fullResponse));
@@ -1409,7 +2000,29 @@ async function handleMessageInternal(
         session.lastUpdated = Date.now();
 
         // Check auto-compaction after response
-        await executeAutoCompact(ctx.agent, session, flushState, compactionModel, compactionConfig, log);
+        flushState = await executeAutoCompact(
+            ctx.agent,
+            session,
+            flushState,
+            compactionModel,
+            compactionConfig,
+            log,
+            {
+                store: persistedSessionStore,
+                sessionKey: scope.key,
+                conversationId,
+                workspacePath: memoryWorkspacePath,
+                config,
+            }
+        );
+        session.totalTokens = flushState.totalTokens;
+        await persistSession({
+            sessionKey: scope.key,
+            scopeKey: scope.key,
+            session,
+            store: persistedSessionStore,
+            log,
+        });
 
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1482,16 +2095,17 @@ async function executeMemoryFlush(
     agent: any,
     session: SessionState,
     flushState: MemoryFlushState,
-    log: Logger
+    log: Logger,
+    options?: { preserveTokenCount?: boolean }
 ): Promise<MemoryFlushState> {
     log.info('[DingTalk] Executing memory flush...');
+    const tokensBeforeFlush = flushState.totalTokens;
 
     try {
         const result = await agent.invoke(
             {
                 messages: [
-                    { role: 'system', content: MEMORY_FLUSH_SYSTEM_PROMPT },
-                    { role: 'user', content: MEMORY_FLUSH_USER_PROMPT },
+                    { role: 'user', content: buildMemoryFlushPrompt() },
                 ],
             },
             {
@@ -1511,7 +2125,15 @@ async function executeMemoryFlush(
             }
         }
 
-        return markFlushCompleted(flushState);
+        const nextState = markFlushCompleted(flushState);
+        if (options?.preserveTokenCount) {
+            return {
+                ...nextState,
+                totalTokens: tokensBeforeFlush,
+                lastFlushTokens: tokensBeforeFlush,
+            };
+        }
+        return nextState;
     } catch (error) {
         log.error('[DingTalk] Memory flush failed:', String(error));
         return flushState;
@@ -1528,18 +2150,27 @@ async function executeAutoCompact(
     flushState: MemoryFlushState,
     compactionModel: BaseChatModel,
     compactionConfig: CompactionConfig,
-    log: Logger
-): Promise<void> {
-    if (!shouldAutoCompact(flushState.totalTokens, compactionConfig)) {
-        return;
+    log: Logger,
+    options?: {
+        store: DingTalkSessionStore | null;
+        sessionKey: string;
+        conversationId: string;
+        workspacePath: string;
+        config: Config;
     }
-
-    log.info('[DingTalk] Auto-compacting context...');
+): Promise<MemoryFlushState> {
+    const tokensBeforeAutoCompact = flushState.totalTokens;
 
     // First: flush memory to save important info
     if (shouldTriggerMemoryFlush(flushState, compactionConfig)) {
-        flushState = await executeMemoryFlush(agent, session, flushState, log);
+        flushState = await executeMemoryFlush(agent, session, flushState, log, { preserveTokenCount: true });
     }
+
+    if (!shouldAutoCompact(tokensBeforeAutoCompact, compactionConfig)) {
+        return flushState;
+    }
+
+    log.info('[DingTalk] Auto-compacting context...');
 
     // Then: compact context
     try {
@@ -1549,10 +2180,146 @@ async function executeAutoCompact(
         session.messageHistory = result.messages;
         session.totalTokens = result.tokensAfter;
         session.compactionCount += 1;
+        flushState = markFlushCompleted(flushState);
+        flushState = { ...flushState, totalTokens: result.tokensAfter };
 
         const saved = result.tokensBefore - result.tokensAfter;
         log.info(`[DingTalk] Compaction completed, saved ${formatTokenCount(saved)} tokens`);
+
+        const summaryText = (result.summary || '').trim();
+        if (summaryText && options) {
+            await persistSessionEvent({
+                role: 'summary',
+                content: summaryText,
+                conversationId: options.conversationId,
+                sessionKey: options.sessionKey,
+                store: options.store,
+                workspacePath: options.workspacePath,
+                config: options.config,
+                log,
+                metadata: {
+                    type: 'compaction_summary',
+                    tokensBefore: result.tokensBefore,
+                    tokensAfter: result.tokensAfter,
+                    tokensSaved: saved,
+                    messageCountAfter: result.messages.length,
+                },
+            });
+        }
+
+        return flushState;
     } catch (error) {
         log.error('[DingTalk] Compaction failed:', String(error));
+        return flushState;
     }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+    let timer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+    });
+    return Promise.race([promise, timeout]).finally(() => {
+        if (timer) {
+            clearTimeout(timer);
+        }
+    });
+}
+
+export async function flushSessionsOnShutdown(params: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    agent: any;
+    config: Config;
+    log: Logger;
+    drainTimeoutMs?: number;
+    flushTimeoutMs?: number;
+}): Promise<{
+    drained: boolean;
+    drainedConversations: number;
+    sessionsTotal: number;
+    sessionsFlushed: number;
+    sessionsFlushFailed: number;
+    sessionsPersisted: number;
+}> {
+    const { agent, config, log } = params;
+    const drainTimeoutMs = Math.max(1000, Math.floor(params.drainTimeoutMs ?? 15000));
+    const flushTimeoutMs = Math.max(1000, Math.floor(params.flushTimeoutMs ?? 30000));
+
+    let drained = true;
+    const pendingTasks = Array.from(conversationQueue.values());
+    if (pendingTasks.length > 0) {
+        log.info(`[DingTalk] Waiting pending conversations before shutdown: ${pendingTasks.length}`);
+        try {
+            await withTimeout(
+                Promise.allSettled(pendingTasks).then(() => undefined),
+                drainTimeoutMs,
+                `drain timeout after ${drainTimeoutMs}ms`
+            );
+        } catch (error) {
+            drained = false;
+            log.warn(`[DingTalk] Pending conversation drain skipped: ${String(error)}`);
+        }
+    }
+
+    const store = await getSessionStore(config, log);
+    const entries = Array.from(sessionCache.entries());
+    let sessionsFlushed = 0;
+    let sessionsFlushFailed = 0;
+    let sessionsPersisted = 0;
+
+    for (const [sessionKey, session] of entries) {
+        const shouldFlush = session.messageHistory.length > 0 && session.totalTokens > 0;
+        if (shouldFlush) {
+            try {
+                const flushState: MemoryFlushState = {
+                    ...createMemoryFlushState(),
+                    totalTokens: session.totalTokens,
+                };
+                const nextState = await withTimeout(
+                    executeMemoryFlush(agent, session, flushState, log),
+                    flushTimeoutMs,
+                    `memory flush timeout after ${flushTimeoutMs}ms`
+                );
+                session.totalTokens = nextState.totalTokens;
+                sessionsFlushed += 1;
+            } catch (error) {
+                sessionsFlushFailed += 1;
+                log.warn(`[DingTalk] Shutdown memory flush failed for ${sessionKey}: ${String(error)}`);
+            }
+        }
+
+        session.lastUpdated = Date.now();
+        await persistSession({
+            sessionKey,
+            scopeKey: sessionKey,
+            session,
+            store,
+            log,
+        });
+        sessionsPersisted += 1;
+    }
+
+    return {
+        drained,
+        drainedConversations: pendingTasks.length,
+        sessionsTotal: entries.length,
+        sessionsFlushed,
+        sessionsFlushFailed,
+        sessionsPersisted,
+    };
+}
+
+export async function closeSessionResources(log: Logger): Promise<void> {
+    if (sessionStore) {
+        try {
+            await sessionStore.close();
+        } catch (error) {
+            log.warn(`[DingTalk] Session store close failed: ${String(error)}`);
+        }
+    }
+    sessionStore = null;
+    sessionStoreInitPromise = null;
+    sessionStoreConfigKey = '';
+    sessionCache.clear();
+    hydratedThreadIds.clear();
 }

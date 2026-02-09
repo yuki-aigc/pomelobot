@@ -18,7 +18,13 @@ import {
     hasModelAlias,
     setActiveModelAlias,
 } from './llm.js';
-import { handleMessage, type Logger, type DingTalkInboundMessage } from './channels/dingtalk/index.js';
+import {
+    handleMessage,
+    flushSessionsOnShutdown,
+    closeSessionResources,
+    type Logger,
+    type DingTalkInboundMessage,
+} from './channels/dingtalk/index.js';
 import { sendProactiveMessage } from './channels/dingtalk/client.js';
 import { requestDingTalkExecApproval, withApprovalContext, tryHandleExecApprovalCardCallback } from './channels/dingtalk/approvals.js';
 import { CronService } from './cron/service.js';
@@ -403,8 +409,32 @@ async function main() {
             setCronService(null);
         }
 
+        try {
+            const shutdownResult = await flushSessionsOnShutdown({
+                agent: currentAgent,
+                config,
+                log,
+                drainTimeoutMs: 15000,
+                flushTimeoutMs: 30000,
+            });
+            log.info(
+                `[DingTalk] Shutdown memory flush summary: drained=${shutdownResult.drained} ` +
+                `pending=${shutdownResult.drainedConversations} sessions=${shutdownResult.sessionsTotal} ` +
+                `flushed=${shutdownResult.sessionsFlushed} flush_failed=${shutdownResult.sessionsFlushFailed} ` +
+                `persisted=${shutdownResult.sessionsPersisted}`
+            );
+        } catch (error) {
+            log.warn('[DingTalk] Shutdown memory flush failed:', error instanceof Error ? error.message : String(error));
+        }
+
         // Note: dingtalk-stream doesn't have a disconnect method,
         // the process will exit and close the connection
+        try {
+            await closeSessionResources(log);
+        } catch (error) {
+            log.warn('[DingTalk] session resource cleanup failed:', error instanceof Error ? error.message : String(error));
+        }
+
         if (cleanup) {
             try {
                 await cleanup();
