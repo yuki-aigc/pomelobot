@@ -106,7 +106,7 @@ export function markFlushCompleted(state: MemoryFlushState): MemoryFlushState {
     return {
         ...state,
         totalTokens: 0,  // Reset after flush (compaction simulation)
-        lastFlushTokens: 0,
+        lastFlushTokens: state.totalTokens,
         lastFlushAt: Date.now(),
         flushCount: state.flushCount + 1,
         conversationSummary: [],  // Clear summary after flush

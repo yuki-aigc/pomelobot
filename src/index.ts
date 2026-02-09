@@ -297,8 +297,9 @@ async function main() {
     /**
      * Execute memory flush - save conversation summary to memory file
      */
-    async function executeMemoryFlush(): Promise<void> {
+    async function executeMemoryFlush(options?: { preserveTokenCount?: boolean }): Promise<void> {
         process.stdout.write(`${colors.gray}● ${colors.reset}${colors.dim}Saving memory...${colors.reset}`);
+        const tokensBeforeFlush = flushState.totalTokens;
 
         try {
             const result = await agent.invoke(
@@ -323,6 +324,13 @@ async function main() {
             }
 
             flushState = markFlushCompleted(flushState);
+            if (options?.preserveTokenCount) {
+                flushState = {
+                    ...flushState,
+                    totalTokens: tokensBeforeFlush,
+                    lastFlushTokens: tokensBeforeFlush,
+                };
+            }
         } catch (error) {
             process.stdout.write(` ${colors.red}✗${colors.reset}\n`);
             console.error(`${colors.red}Error during memory flush:${colors.reset}`, error instanceof Error ? error.message : error);
@@ -333,13 +341,15 @@ async function main() {
      * Execute auto-compaction if needed (with memory flush first)
      */
     async function executeAutoCompact(): Promise<void> {
-        if (!shouldAutoCompact(flushState.totalTokens, config.agent.compaction)) {
-            return;
-        }
+        const tokensBeforeAutoCompact = flushState.totalTokens;
 
         // First: flush memory to save important info
         if (shouldTriggerMemoryFlush(flushState, config.agent.compaction)) {
-            await executeMemoryFlush();
+            await executeMemoryFlush({ preserveTokenCount: true });
+        }
+
+        if (!shouldAutoCompact(tokensBeforeAutoCompact, config.agent.compaction)) {
+            return;
         }
 
         // Then: compact context
@@ -351,6 +361,7 @@ async function main() {
 
             messageHistory = result.messages;
             flushState = markFlushCompleted(flushState);
+            flushState = { ...flushState, totalTokens: result.tokensAfter };
 
             const saved = result.tokensBefore - result.tokensAfter;
             process.stdout.write(` ${colors.green}✓${colors.reset} (${formatTokenCount(saved)} saved)\n`);
@@ -454,6 +465,7 @@ async function main() {
                             );
                             messageHistory = compactResult.messages;
                             flushState = markFlushCompleted(flushState);
+                            flushState = { ...flushState, totalTokens: compactResult.tokensAfter };
 
                             const saved = compactResult.tokensBefore - compactResult.tokensAfter;
                             responseText = saved > 0

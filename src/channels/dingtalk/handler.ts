@@ -1133,7 +1133,8 @@ async function handleMessageInternal(
     const compactionConfig = config.agent.compaction;
 
     // Check if we need auto-compaction before processing
-    await executeAutoCompact(ctx.agent, session, flushState, compactionModel, compactionConfig, log);
+    flushState = await executeAutoCompact(ctx.agent, session, flushState, compactionModel, compactionConfig, log);
+    session.totalTokens = flushState.totalTokens;
 
     // Determine message mode
     const useCardMode = dingtalkConfig.messageType === 'card';
@@ -1409,7 +1410,8 @@ async function handleMessageInternal(
         session.lastUpdated = Date.now();
 
         // Check auto-compaction after response
-        await executeAutoCompact(ctx.agent, session, flushState, compactionModel, compactionConfig, log);
+        flushState = await executeAutoCompact(ctx.agent, session, flushState, compactionModel, compactionConfig, log);
+        session.totalTokens = flushState.totalTokens;
 
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1482,9 +1484,11 @@ async function executeMemoryFlush(
     agent: any,
     session: SessionState,
     flushState: MemoryFlushState,
-    log: Logger
+    log: Logger,
+    options?: { preserveTokenCount?: boolean }
 ): Promise<MemoryFlushState> {
     log.info('[DingTalk] Executing memory flush...');
+    const tokensBeforeFlush = flushState.totalTokens;
 
     try {
         const result = await agent.invoke(
@@ -1511,7 +1515,15 @@ async function executeMemoryFlush(
             }
         }
 
-        return markFlushCompleted(flushState);
+        const nextState = markFlushCompleted(flushState);
+        if (options?.preserveTokenCount) {
+            return {
+                ...nextState,
+                totalTokens: tokensBeforeFlush,
+                lastFlushTokens: tokensBeforeFlush,
+            };
+        }
+        return nextState;
     } catch (error) {
         log.error('[DingTalk] Memory flush failed:', String(error));
         return flushState;
@@ -1529,17 +1541,19 @@ async function executeAutoCompact(
     compactionModel: BaseChatModel,
     compactionConfig: CompactionConfig,
     log: Logger
-): Promise<void> {
-    if (!shouldAutoCompact(flushState.totalTokens, compactionConfig)) {
-        return;
-    }
-
-    log.info('[DingTalk] Auto-compacting context...');
+): Promise<MemoryFlushState> {
+    const tokensBeforeAutoCompact = flushState.totalTokens;
 
     // First: flush memory to save important info
     if (shouldTriggerMemoryFlush(flushState, compactionConfig)) {
-        flushState = await executeMemoryFlush(agent, session, flushState, log);
+        flushState = await executeMemoryFlush(agent, session, flushState, log, { preserveTokenCount: true });
     }
+
+    if (!shouldAutoCompact(tokensBeforeAutoCompact, compactionConfig)) {
+        return flushState;
+    }
+
+    log.info('[DingTalk] Auto-compacting context...');
 
     // Then: compact context
     try {
@@ -1549,10 +1563,14 @@ async function executeAutoCompact(
         session.messageHistory = result.messages;
         session.totalTokens = result.tokensAfter;
         session.compactionCount += 1;
+        flushState = markFlushCompleted(flushState);
+        flushState = { ...flushState, totalTokens: result.tokensAfter };
 
         const saved = result.tokensBefore - result.tokensAfter;
         log.info(`[DingTalk] Compaction completed, saved ${formatTokenCount(saved)} tokens`);
+        return flushState;
     } catch (error) {
         log.error('[DingTalk] Compaction failed:', String(error));
+        return flushState;
     }
 }

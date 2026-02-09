@@ -12,8 +12,7 @@ export interface MemoryMiddlewareOptions {
  * Get today's date in YYYY-MM-DD format
  */
 function getTodayDate(): string {
-    const now = new Date();
-    return now.toISOString().split('T')[0];
+    return formatLocalDate(new Date());
 }
 
 /**
@@ -22,7 +21,14 @@ function getTodayDate(): string {
 function getYesterdayDate(): string {
     const now = new Date();
     now.setDate(now.getDate() - 1);
-    return now.toISOString().split('T')[0];
+    return formatLocalDate(now);
+}
+
+function formatLocalDate(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
 }
 
 /**

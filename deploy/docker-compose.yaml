@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pomelobot-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432" # 宿主机可通过 localhost:5432 连接
+    environment:
+      POSTGRES_USER: pomelobot
+      POSTGRES_PASSWORD: Admin@123
+      POSTGRES_DB: pomelobot
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pomelobot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+    driver: local
+
+# 启用向量扩展：CREATE EXTENSION IF NOT EXISTS vector;
