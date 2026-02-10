@@ -16,6 +16,7 @@ export function loadMemoryContext(workspacePath: string): string {
     return [
         '记忆采用按需检索模式。',
         '当用户询问“你还记得吗/之前/上次/今天/昨天/我们聊过什么”等历史回溯问题时，先调用 memory_search。',
+        '当需要精确引用记忆（数字、日期、阈值、原话）时，先 memory_search，再用 memory_get 读取命中片段。',
         '若检索不足，请明确说明“已检索但信息不足”，不要臆造记忆。',
     ].join('\n');
 }
@@ -70,14 +71,36 @@ export function createMemoryTools(workspacePath: string, config: Config) {
         },
         {
             name: 'memory_search',
-            description: '在当前会话作用域的记忆中搜索（支持 keyword/fts/vector/hybrid）',
+            description: '在当前会话作用域的记忆中搜索（支持 keyword/fts/vector/hybrid），返回 path/行号供 memory_get 精读',
             schema: z.object({
                 query: z.string().describe('搜索关键词或语义查询'),
             }),
         }
     );
 
-    return [memorySave, memorySearch];
+    const memoryGet = tool(
+        async ({ path, from, lines }: { path: string; from?: number; lines?: number }) => {
+            const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+            const runtime = await runtimePromise;
+            const result = await runtime.get(path, { from, lines }, scope);
+            const meta = [
+                `已读取记忆片段: ${result.path}`,
+                `(scope=${result.scope}, source=${result.source}, from=${result.fromLine}, lines=${result.lineCount}, to=${result.toLine}${result.truncated ? ', truncated=true' : ''})`,
+            ].join(' ');
+            return `${meta}\n${result.text || '(空结果)'}`;
+        },
+        {
+            name: 'memory_get',
+            description: '按 path 精读记忆片段（建议先 memory_search）。支持 MEMORY.md / memory/**/*.md / session_events 路径，可选 from/lines。',
+            schema: z.object({
+                path: z.string().describe('要读取的记忆路径，建议直接使用 memory_search 返回的 path'),
+                from: z.number().int().min(1).optional().describe('起始行号（从 1 开始），默认 1'),
+                lines: z.number().int().min(1).max(300).optional().describe('读取行数，默认 40，最大 300'),
+            }),
+        }
+    );
+
+    return [memorySave, memorySearch, memoryGet];
 }
 
 export async function recordSessionTranscript(

@@ -31,8 +31,8 @@ ENV NPM_CONFIG_PREFIX=/home/ubuntu/.npm-global
 ENV PATH=/home/ubuntu/.npm-global/bin:$PATH
 ENV HOME=/home/ubuntu
 
-# 安装 pnpm 和 qwen-code
-RUN npm install -g pnpm && npm install -g @qwen-code/qwen-code@latest
+# 安装 pnpm 
+RUN npm install -g pnpm 
 
 # 创建应用目录
 WORKDIR /app
@@ -46,10 +46,7 @@ RUN pnpm install --frozen-lockfile
 # 复制源代码
 COPY --chown=ubuntu:0 . .
 
-# 配置 Qwen Code 
-RUN mkdir -p ~/.qwen && \
-    cp /app/.qwen/config/settings.json ~/.qwen/settings.json && \
-    cp -r /app/.qwen/config/skills ~/.qwen/skills
+
 
 # 创建 workspace 目录
 RUN mkdir -p workspace

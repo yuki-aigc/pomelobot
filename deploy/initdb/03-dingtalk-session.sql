@@ -2,6 +2,7 @@
 -- Keep in sync with src/channels/dingtalk/session-store.ts
 
 CREATE SCHEMA IF NOT EXISTS pomelobot_memory;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS pomelobot_memory.dingtalk_sessions (
     session_key TEXT PRIMARY KEY,
@@ -31,7 +32,9 @@ CREATE TABLE IF NOT EXISTS pomelobot_memory.dingtalk_session_events (
     content TEXT NOT NULL,
     metadata_json JSONB,
     created_at BIGINT NOT NULL,
-    inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    embedding vector(1536),
+    embedding_updated_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS dingtalk_session_events_session_idx
@@ -40,6 +43,13 @@ CREATE INDEX IF NOT EXISTS dingtalk_session_events_session_idx
 CREATE INDEX IF NOT EXISTS dingtalk_session_events_conversation_idx
     ON pomelobot_memory.dingtalk_session_events (conversation_id, created_at DESC);
 
+CREATE INDEX IF NOT EXISTS dingtalk_session_events_created_at_idx
+    ON pomelobot_memory.dingtalk_session_events (created_at DESC);
+
 CREATE INDEX IF NOT EXISTS dingtalk_session_events_fts_idx
     ON pomelobot_memory.dingtalk_session_events
     USING GIN (to_tsvector('simple', COALESCE(content, '')));
+
+CREATE INDEX IF NOT EXISTS dingtalk_session_events_embedding_ivf_idx
+    ON pomelobot_memory.dingtalk_session_events
+    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
