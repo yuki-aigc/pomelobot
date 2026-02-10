@@ -22,12 +22,15 @@
 | 能力 | 说明 |
 |------|------|
 | 🧠 **记忆系统** | PGSQL 增量索引（可回退文件模式），支持 FTS / Vector / Hybrid 检索与会话隔离 |
+| 🧩 **冷启动记忆** | DingTalk 会话首轮可注入“今天/昨天”Markdown 摘要（有注入限额，避免 token 膨胀） |
+| ⚡ **会话向量召回** | `dingtalk_session_events` 向量异步回填 + PG 内 ANN 检索，失败自动回退 FTS / temporal |
+| ♻️ **会话TTL治理** | `dingtalk_session_events` 支持按 TTL 自动清理，控制历史体量与检索成本 |
 | 🧹 **上下文压缩** | 自动 / 手动压缩对话历史，实时展示 Token 使用情况 |
 | 🛠️ **技能系统** | 以 `SKILL.md` 定义技能，动态加载并通过子代理协作 |
 | 🔌 **MCP 集成** | 通过 `@langchain/mcp-adapters` 挂载 MCP 工具（stdio / http / sse） |
 | 🤖 **多模型支持** | OpenAI / Anthropic（多模型配置池，运行时 `/model` 热切换） |
 | 💬 **多渠道接入** | CLI 交互 + DingTalk Stream 机器人（消息卡片 / Markdown） |
-| ⏰ **定时任务** | Cron 调度，支持持久化、JSONL 运行日志、群聊 / 私聊推送 |
+| ⏰ **定时任务** | Cron 调度，支持持久化、JSONL 运行日志、群聊 / 私聊推送；启动时幂等确保 04:00 每日记忆归档任务 |
 | 🧾 **命令执行** | 白名单 / 黑名单策略 + 审批机制，超时与输出长度限制 |
 | 📁 **文件读写** | 基于 `FilesystemBackend` 的工作区文件系统，支撑记忆与技能存储 |
 | 🔍 **审计日志** | 命令执行全链路审计（策略判定、审批决策、执行结果） |
@@ -63,6 +66,12 @@ pnpm dev
 # DingTalk 机器人模式
 pnpm dingtalk
 ```
+
+## 文档导航
+
+- [Memory 机制说明](docs/memory.md)
+- [Compaction 机制说明](docs/compaction.md)
+- [Memory + Compaction 流程图](docs/architecture-memory-compaction.md)
 
 ## 项目结构
 
@@ -176,55 +185,69 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 ```jsonc
 {
-    "agent": {
-        "workspace": "./workspace",           // 工作区根目录
-        "skills_dir": "./workspace/skills",   // 技能目录
-        "recursion_limit": 50,                // LangGraph 递归上限（防止无限循环）
-        "compaction": {
-            "enabled": true,                  // 是否开启上下文压缩
-            "auto_compact_threshold": 80000,  // 自动压缩阈值（tokens）
-            "context_window": 128000,         // 模型上下文窗口大小
-            "reserve_tokens": 20000,          // 压缩后保留的 token 数
-            "max_history_share": 0.5          // 历史保留比例
-        },
-        "memory": {
-            "backend": "pgsql",               // filesystem | pgsql
-            "pgsql": {
-                "enabled": true,
-                "connection_string": "postgres://user:pass@127.0.0.1:5432/pomelobot",
-                "schema": "pomelobot_memory"
-            },
-            "retrieval": {
-                "mode": "hybrid",             // keyword | fts | vector | hybrid
-                "max_results": 8,
-                "min_score": 0.1,
-                "sync_on_search": true,
-                "sync_min_interval_ms": 20000,
-                "include_session_events": true,   // 是否把 dingtalk_session_events 纳入统一检索
-                "session_events_max_results": 6   // 每次检索最多合并多少条 session events
-            },
-            "embedding": {
-                "enabled": true,              // 关闭后自动退化为非向量检索
-                "cache_enabled": true,
-                "providers": [
-                    {
-                        "provider": "openai",
-                        "base_url": "https://api.openai.com/v1",
-                        "model": "text-embedding-3-small",
-                        "api_key": ""
-                    }
-                ]
-            },
-            "session_isolation": {
-                "enabled": true,
-                "direct_scope": "main",       // main | direct
-                "group_scope_prefix": "group_"
-            },
-            "transcript": {
-                "enabled": false
-            }
-        }
+  "agent": {
+    "workspace": "./workspace",           // 工作区根目录
+    "skills_dir": "./workspace/skills",   // 技能目录
+    "recursion_limit": 50,                // LangGraph 递归上限（防止无限循环）
+    "compaction": {
+      "enabled": true,                  // 是否开启上下文压缩
+      "auto_compact_threshold": 80000,  // 自动压缩阈值（tokens）
+      "context_window": 128000,         // 模型上下文窗口大小
+      "reserve_tokens": 20000,          // 压缩后保留的 token 数
+      "max_history_share": 0.5          // 历史保留比例
+    },
+    "memory": {
+      "backend": "pgsql",               // filesystem | pgsql
+      "pgsql": {
+        "enabled": true,
+        "connection_string": "",      // 推荐通过环境变量 MEMORY_PG_CONNECTION_STRING 注入
+        "host": "127.0.0.1",
+        "port": 5432,
+        "user": "pomelobot",
+        "password": "",
+        "database": "pomelobot",
+        "ssl": false,
+        "schema": "pomelobot_memory"
+      },
+      "retrieval": {
+        "mode": "hybrid",             // keyword | fts | vector | hybrid
+        "max_results": 8,
+        "min_score": 0.1,
+        "sync_on_search": true,
+        "sync_min_interval_ms": 20000,
+        "hybrid_vector_weight": 0.6,
+        "hybrid_fts_weight": 0.4,
+        "hybrid_candidate_multiplier": 2,
+        "include_session_events": true,   // 是否把 dingtalk_session_events 纳入统一检索
+        "session_events_max_results": 6,  // 每次检索最多合并多少条 session events
+        "session_events_vector_async_enabled": true,
+        "session_events_vector_async_interval_ms": 5000,
+        "session_events_vector_async_batch_size": 16,
+        "session_events_ttl_days": 30,
+        "session_events_ttl_cleanup_interval_ms": 600000
+      },
+      "embedding": {
+        "enabled": true,              // 关闭后自动退化为非向量检索
+        "cache_enabled": true,
+        "providers": [
+          {
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "model": "text-embedding-3-small",
+            "api_key": ""
+          }
+        ]
+      },
+      "session_isolation": {
+        "enabled": true,
+        "direct_scope": "main",       // main | direct
+        "group_scope_prefix": "group_"
+      },
+      "transcript": {
+        "enabled": false
+      }
     }
+  }
 }
 ```
 
@@ -317,7 +340,8 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
         "cron": {
             "defaultTarget": "cidxxxx",     // 定时任务默认推送群（openConversationId）
             "useMarkdown": true,
-            "title": "Pomelobot 定时任务"
+            "title": "Pomelobot 定时任务",
+            "autoMemorySaveAt4": true       // 启动时幂等确保 04:00 每日记忆归档任务
         },
         "execApprovals": {
             "enabled": false,               // 是否开启命令审批
@@ -416,6 +440,8 @@ pnpm dingtalk
 - **多媒体处理**：图片自动视觉理解；文件尝试文本抽取；视频抽帧摘要（需安装 `ffmpeg`）
 - **文件回传**：回复中包含 `<dingtalk-file path="workspace/xxx" />` 标记时，自动上传并回传文件（仅限 `workspace/` 下，单文件 ≤ 10MB）
 - **定时推送**：通过 `cron_job_*` 工具管理定时任务，支持群聊 / 私聊推送
+- **首轮记忆注入**：会话首轮自动注入今天/昨天 Markdown 摘要（受限额控制，不读取向量库）
+- **自动归档任务**：启动时幂等确保 04:00 的 daily memory_save 任务（可通过 `dingtalk.cron.autoMemorySaveAt4=false` 关闭）
 
 ### 所需权限
 
