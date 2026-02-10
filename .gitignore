@@ -5,8 +5,8 @@ logs/
 .env
 config.local.json
 
-# Keep workspace structure but ignore daily memory logs
-workspace/memory/*.md
+# Keep workspace structure but ignore memory contents
+workspace/memory/**
 !workspace/memory/.gitkeep
 config.json
 config.json.bak

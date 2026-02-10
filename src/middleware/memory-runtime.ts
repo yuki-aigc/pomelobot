@@ -16,6 +16,13 @@ const DEFAULT_CHUNK_CHARS = 1200;
 const DEFAULT_CHUNK_OVERLAP = 180;
 const DEFAULT_VECTOR_DIMENSIONS = 1536;
 const TRANSCRIPT_SYNC_DEBOUNCE_MS = 1500;
+const DEFAULT_MEMORY_GET_LINES = 40;
+const MAX_MEMORY_GET_LINES = 300;
+const MAX_MEMORY_GET_CHARS = 12000;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const TEMPORAL_RECENT_DAYS = 7;
+const SESSION_VECTOR_TEXT_MAX_CHARS = 1600;
+const SESSION_EVENTS_TTL_DELETE_BATCH = 2000;
 
 type MemorySourceType = 'daily' | 'long-term' | 'transcript' | 'session';
 
@@ -50,6 +57,22 @@ export interface MemorySaveResult {
     scope: string;
 }
 
+export interface MemoryGetOptions {
+    from?: number;
+    lines?: number;
+}
+
+export interface MemoryGetResult {
+    path: string;
+    scope: string;
+    source: MemorySourceType;
+    fromLine: number;
+    toLine: number;
+    lineCount: number;
+    text: string;
+    truncated: boolean;
+}
+
 interface SearchRow {
     rel_path: string;
     chunk_index: number;
@@ -58,6 +81,76 @@ interface SearchRow {
     content: string;
     source_type: MemorySourceType;
     score: number;
+}
+
+interface SessionEventRow {
+    role: string;
+    content: string;
+}
+
+interface SessionEventSearchRow {
+    id: number | string;
+    session_key: string;
+    conversation_id: string;
+    role: string;
+    content: string;
+    created_at: number | string;
+}
+
+function escapeLikePattern(value: string): string {
+    return value.replace(/[\\%_]/g, '\\$&');
+}
+
+function tokenizeLexicalQuery(query: string): string[] {
+    const text = query.trim();
+    if (!text) {
+        return [];
+    }
+
+    const tokens = new Set<string>();
+    const addToken = (token: string) => {
+        const normalized = token.trim().toLowerCase();
+        if (!normalized) {
+            return;
+        }
+        tokens.add(normalized);
+    };
+
+    addToken(text);
+
+    const latinTokens = text.match(/[A-Za-z0-9_:-]{2,}/g) ?? [];
+    for (const token of latinTokens) {
+        addToken(token);
+    }
+
+    const cjkRuns = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) ?? [];
+    for (const run of cjkRuns) {
+        addToken(run);
+        if (run.length <= 1) {
+            continue;
+        }
+
+        for (let i = 0; i < run.length - 1; i += 1) {
+            addToken(run.slice(i, i + 2));
+        }
+        for (let i = 0; i < run.length - 2; i += 1) {
+            addToken(run.slice(i, i + 3));
+        }
+    }
+
+    return Array.from(tokens)
+        .sort((a, b) => b.length - a.length)
+        .slice(0, 16);
+}
+
+function buildFtsQueryText(query: string): string {
+    const tokens = tokenizeLexicalQuery(query)
+        .map((token) => token.replace(/[&|!():*'"]/g, ' ').trim())
+        .filter((token) => token.length > 0);
+    if (tokens.length === 0) {
+        return query.trim();
+    }
+    return tokens.join(' ');
 }
 
 function sortRowsByScore(rows: SearchRow[]): SearchRow[] {
@@ -356,10 +449,16 @@ export class MemoryRuntime {
     private pgReady = false;
     private vectorAvailable = false;
     private sessionEventsAvailable = false;
+    private sessionEventVectorAvailable = false;
     private syncInFlight: Promise<void> | null = null;
     private lastSearchSyncAt = 0;
     private syncDebounceTimer: NodeJS.Timeout | null = null;
     private pendingSyncPaths = new Set<string>();
+    private sessionEventEmbeddingBackfillTimer: NodeJS.Timeout | null = null;
+    private sessionEventEmbeddingBackfillInFlight: Promise<void> | null = null;
+    private sessionEventTtlCleanupTimer: NodeJS.Timeout | null = null;
+    private sessionEventTtlCleanupInFlight: Promise<void> | null = null;
+    private lastSessionEventTtlCleanupAt = 0;
     private readonly embeddingProviderState: EmbeddingProviderState = {
         dimensionMismatch: new Set<string>(),
     };
@@ -400,6 +499,7 @@ export class MemoryRuntime {
             await this.ensurePgSchema();
             this.pgReady = true;
             await this.syncIncremental({ force: true });
+            this.startBackgroundWorkers();
         } catch (error) {
             console.warn('[Memory] PGSQL initialization failed, fallback to filesystem:', error instanceof Error ? error.message : String(error));
             await this.pool?.end().catch(() => undefined);
@@ -407,6 +507,7 @@ export class MemoryRuntime {
             this.pgReady = false;
             this.vectorAvailable = false;
             this.sessionEventsAvailable = false;
+            this.sessionEventVectorAvailable = false;
         }
     }
 
@@ -415,6 +516,9 @@ export class MemoryRuntime {
     }
 
     async close(): Promise<void> {
+        this.stopBackgroundWorkers();
+        await this.sessionEventEmbeddingBackfillInFlight?.catch(() => undefined);
+        await this.sessionEventTtlCleanupInFlight?.catch(() => undefined);
         if (this.syncDebounceTimer) {
             clearTimeout(this.syncDebounceTimer);
             this.syncDebounceTimer = null;
@@ -427,6 +531,51 @@ export class MemoryRuntime {
         this.pgReady = false;
         this.vectorAvailable = false;
         this.sessionEventsAvailable = false;
+        this.sessionEventVectorAvailable = false;
+    }
+
+    private startBackgroundWorkers(): void {
+        this.stopBackgroundWorkers();
+        if (!this.canUsePg()) {
+            return;
+        }
+
+        const retrieval = this.memoryConfig.retrieval;
+        if (
+            retrieval.session_events_vector_async_enabled
+            && this.memoryConfig.embedding.enabled
+            && this.sessionEventsAvailable
+            && this.sessionEventVectorAvailable
+        ) {
+            const intervalMs = Math.max(1000, retrieval.session_events_vector_async_interval_ms);
+            this.sessionEventEmbeddingBackfillTimer = setInterval(() => {
+                void this.backfillSessionEventEmbeddings();
+            }, intervalMs);
+            void this.backfillSessionEventEmbeddings();
+        }
+
+        if (retrieval.session_events_ttl_days > 0 && this.sessionEventsAvailable) {
+            const intervalMs = Math.max(60_000, retrieval.session_events_ttl_cleanup_interval_ms);
+            this.sessionEventTtlCleanupTimer = setInterval(() => {
+                void this.cleanupExpiredSessionEvents();
+            }, intervalMs);
+            void this.cleanupExpiredSessionEvents();
+        }
+    }
+
+    private stopBackgroundWorkers(): void {
+        this.stopSessionEventEmbeddingWorker();
+        if (this.sessionEventTtlCleanupTimer) {
+            clearInterval(this.sessionEventTtlCleanupTimer);
+            this.sessionEventTtlCleanupTimer = null;
+        }
+    }
+
+    private stopSessionEventEmbeddingWorker(): void {
+        if (this.sessionEventEmbeddingBackfillTimer) {
+            clearInterval(this.sessionEventEmbeddingBackfillTimer);
+            this.sessionEventEmbeddingBackfillTimer = null;
+        }
     }
 
     private async ensurePgSchema(): Promise<void> {
@@ -509,6 +658,10 @@ export class MemoryRuntime {
                  ON ${this.sessionEventsTable} (conversation_id, created_at DESC)`
             );
             await this.pool.query(
+                `CREATE INDEX IF NOT EXISTS dingtalk_session_events_created_at_idx
+                 ON ${this.sessionEventsTable} (created_at DESC)`
+            );
+            await this.pool.query(
                 `CREATE INDEX IF NOT EXISTS dingtalk_session_events_fts_idx
                  ON ${this.sessionEventsTable}
                  USING GIN (to_tsvector('simple', coalesce(content, '')))`
@@ -521,6 +674,7 @@ export class MemoryRuntime {
 
         if (!this.memoryConfig.embedding.enabled) {
             this.vectorAvailable = false;
+            this.sessionEventVectorAvailable = false;
             return;
         }
 
@@ -528,6 +682,8 @@ export class MemoryRuntime {
             await this.pool.query('CREATE EXTENSION IF NOT EXISTS vector');
             await this.pool.query(`ALTER TABLE ${this.chunksTable} ADD COLUMN IF NOT EXISTS embedding vector(${DEFAULT_VECTOR_DIMENSIONS})`);
             await this.pool.query(`ALTER TABLE ${this.embeddingCacheTable} ADD COLUMN IF NOT EXISTS embedding vector(${DEFAULT_VECTOR_DIMENSIONS})`);
+            await this.pool.query(`ALTER TABLE ${this.sessionEventsTable} ADD COLUMN IF NOT EXISTS embedding vector(${DEFAULT_VECTOR_DIMENSIONS})`);
+            await this.pool.query(`ALTER TABLE ${this.sessionEventsTable} ADD COLUMN IF NOT EXISTS embedding_updated_at TIMESTAMPTZ`);
             await this.pool.query(
                 `UPDATE ${this.chunksTable}
                  SET embedding = NULL
@@ -536,6 +692,12 @@ export class MemoryRuntime {
             );
             await this.pool.query(
                 `UPDATE ${this.embeddingCacheTable}
+                 SET embedding = NULL
+                 WHERE embedding IS NOT NULL
+                   AND vector_dims(embedding) <> ${DEFAULT_VECTOR_DIMENSIONS}`
+            );
+            await this.pool.query(
+                `UPDATE ${this.sessionEventsTable}
                  SET embedding = NULL
                  WHERE embedding IS NOT NULL
                    AND vector_dims(embedding) <> ${DEFAULT_VECTOR_DIMENSIONS}`
@@ -559,12 +721,27 @@ export class MemoryRuntime {
                  END`
             );
             await this.pool.query(
+                `ALTER TABLE ${this.sessionEventsTable}
+                 ALTER COLUMN embedding TYPE vector(${DEFAULT_VECTOR_DIMENSIONS})
+                 USING CASE
+                    WHEN embedding IS NULL THEN NULL
+                    WHEN vector_dims(embedding) = ${DEFAULT_VECTOR_DIMENSIONS} THEN embedding::vector(${DEFAULT_VECTOR_DIMENSIONS})
+                    ELSE NULL
+                 END`
+            );
+            await this.pool.query(
                 `CREATE INDEX IF NOT EXISTS memory_chunks_embedding_ivf_idx
                  ON ${this.chunksTable} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`
             );
+            await this.pool.query(
+                `CREATE INDEX IF NOT EXISTS dingtalk_session_events_embedding_ivf_idx
+                 ON ${this.sessionEventsTable} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`
+            );
             this.vectorAvailable = true;
+            this.sessionEventVectorAvailable = true;
         } catch (error) {
             this.vectorAvailable = false;
+            this.sessionEventVectorAvailable = false;
             console.warn('[Memory] pgvector unavailable, vector retrieval disabled:', error instanceof Error ? error.message : String(error));
         }
     }
@@ -626,6 +803,144 @@ export class MemoryRuntime {
             .catch((error) => {
                 console.warn('[Memory] deferred incremental sync failed:', error instanceof Error ? error.message : String(error));
             });
+    }
+
+    private shouldRunSessionEventEmbeddingBackfill(): boolean {
+        return this.canUsePg()
+            && this.memoryConfig.embedding.enabled
+            && this.embeddingProviders.length > 0
+            && this.memoryConfig.retrieval.session_events_vector_async_enabled
+            && this.sessionEventsAvailable
+            && this.sessionEventVectorAvailable;
+    }
+
+    private async backfillSessionEventEmbeddings(): Promise<void> {
+        if (this.sessionEventEmbeddingBackfillInFlight) {
+            return this.sessionEventEmbeddingBackfillInFlight;
+        }
+        if (!this.shouldRunSessionEventEmbeddingBackfill() || !this.pool) {
+            return;
+        }
+
+        this.sessionEventEmbeddingBackfillInFlight = (async () => {
+            const batchSize = Math.max(1, this.memoryConfig.retrieval.session_events_vector_async_batch_size);
+            try {
+                const result = await this.pool!.query<SessionEventSearchRow>(
+                    `SELECT id, role, content
+                     FROM ${this.sessionEventsTable}
+                     WHERE embedding IS NULL
+                       AND length(trim(content)) > 0
+                     ORDER BY created_at ASC
+                     LIMIT $1`,
+                    [batchSize]
+                );
+                if (result.rows.length === 0) {
+                    return;
+                }
+
+                let updatedCount = 0;
+                for (const row of result.rows) {
+                    const baseText = `[${row.role}] ${row.content}`;
+                    if (!baseText.trim()) {
+                        continue;
+                    }
+                    const embedText = baseText.length > SESSION_VECTOR_TEXT_MAX_CHARS
+                        ? `${baseText.slice(0, SESSION_VECTOR_TEXT_MAX_CHARS - 1)}…`
+                        : baseText;
+                    const embedHash = sha256(`session-event:${row.id}:${embedText}`);
+                    const embedding = await this.getOrCreateEmbedding(embedText, embedHash);
+                    if (!embedding || embedding.length === 0) {
+                        continue;
+                    }
+
+                    await this.pool!.query(
+                        `UPDATE ${this.sessionEventsTable}
+                         SET embedding = $2::vector,
+                             embedding_updated_at = NOW()
+                         WHERE id = $1
+                           AND embedding IS NULL`,
+                        [row.id, toVectorLiteral(embedding)]
+                    );
+                    updatedCount += 1;
+                }
+
+                if (updatedCount > 0) {
+                    console.info(`[Memory] session event embedding backfill updated=${updatedCount}`);
+                }
+            } catch (error) {
+                const code = typeof error === 'object' && error !== null && 'code' in error
+                    ? String((error as { code?: unknown }).code ?? '')
+                    : '';
+                if (code === '42P01' || code === '42703') {
+                    this.sessionEventsAvailable = false;
+                    this.sessionEventVectorAvailable = false;
+                    this.stopBackgroundWorkers();
+                }
+                console.warn('[Memory] session event embedding backfill failed:', error instanceof Error ? error.message : String(error));
+            }
+        })().finally(() => {
+            this.sessionEventEmbeddingBackfillInFlight = null;
+        });
+
+        return this.sessionEventEmbeddingBackfillInFlight;
+    }
+
+    private shouldRunSessionEventTtlCleanup(): boolean {
+        return this.canUsePg()
+            && this.sessionEventsAvailable
+            && this.memoryConfig.retrieval.session_events_ttl_days > 0;
+    }
+
+    private async cleanupExpiredSessionEvents(): Promise<void> {
+        if (this.sessionEventTtlCleanupInFlight) {
+            return this.sessionEventTtlCleanupInFlight;
+        }
+        if (!this.shouldRunSessionEventTtlCleanup() || !this.pool) {
+            return;
+        }
+
+        const cleanupInterval = Math.max(60_000, this.memoryConfig.retrieval.session_events_ttl_cleanup_interval_ms);
+        const now = Date.now();
+        if (now - this.lastSessionEventTtlCleanupAt < cleanupInterval) {
+            return;
+        }
+        this.lastSessionEventTtlCleanupAt = now;
+
+        this.sessionEventTtlCleanupInFlight = (async () => {
+            const ttlDays = this.memoryConfig.retrieval.session_events_ttl_days;
+            const cutoffMs = now - (ttlDays * ONE_DAY_MS);
+            try {
+                const result = await this.pool!.query(
+                    `DELETE FROM ${this.sessionEventsTable}
+                     WHERE id IN (
+                         SELECT id
+                         FROM ${this.sessionEventsTable}
+                         WHERE created_at < $1
+                         ORDER BY created_at ASC
+                         LIMIT $2
+                     )`,
+                    [cutoffMs, SESSION_EVENTS_TTL_DELETE_BATCH]
+                );
+                const deleted = result.rowCount ?? 0;
+                if (deleted > 0) {
+                    console.info(`[Memory] session event ttl cleanup deleted=${deleted} cutoffMs=${cutoffMs}`);
+                }
+            } catch (error) {
+                const code = typeof error === 'object' && error !== null && 'code' in error
+                    ? String((error as { code?: unknown }).code ?? '')
+                    : '';
+                if (code === '42P01' || code === '42703') {
+                    this.sessionEventsAvailable = false;
+                    this.sessionEventVectorAvailable = false;
+                    this.stopBackgroundWorkers();
+                }
+                console.warn('[Memory] session event ttl cleanup failed:', error instanceof Error ? error.message : String(error));
+            }
+        })().finally(() => {
+            this.sessionEventTtlCleanupInFlight = null;
+        });
+
+        return this.sessionEventTtlCleanupInFlight;
     }
 
     private async runIncrementalSync(options?: { force?: boolean; onlyPaths?: string[] }): Promise<void> {
@@ -1089,43 +1404,76 @@ export class MemoryRuntime {
     }
 
     async search(query: string, scope: MemoryScope): Promise<MemorySearchHit[]> {
+        const startedAt = Date.now();
+        const mode = this.memoryConfig.retrieval.mode;
+        const queryForLog = query.replace(/\s+/g, ' ').trim().slice(0, 160);
+        const finish = (
+            hits: MemorySearchHit[],
+            path: string,
+            candidates: Record<string, number> = {},
+            extra: Record<string, string | number | boolean> = {},
+        ) => {
+            this.logSearchTrace({
+                scopeKey: scope.key,
+                mode,
+                query: queryForLog,
+                path,
+                candidates,
+                hits,
+                durationMs: Date.now() - startedAt,
+                extra,
+            });
+            return hits;
+        };
         const fileKeywordFallback = async () => await this.searchFromFiles(query, scope);
 
         if (this.memoryConfig.backend !== 'pgsql' || !this.canUsePg()) {
-            return fileKeywordFallback();
+            const hits = await fileKeywordFallback();
+            return finish(hits, 'filesystem_keyword_fallback', { fileHits: hits.length });
         }
 
         await this.maybeSyncBeforeSearch();
 
-        const mode = this.memoryConfig.retrieval.mode;
         const maxResults = this.memoryConfig.retrieval.max_results;
         const minScore = this.memoryConfig.retrieval.min_score;
-        const keywordFallback = async () => {
+        const keywordFallback = async (fallbackFrom: string) => {
             const rows = await this.searchPgKeywordUnified(query, scope.key, maxResults);
             if (rows.length > 0) {
-                return rows
+                const hits = rows
                     .map((row) => this.rowToHit(row, 'keyword'))
                     .filter((item) => item.score >= minScore)
                     .slice(0, maxResults);
+                return finish(hits, `${fallbackFrom}_keyword`, {
+                    keywordRows: rows.length,
+                    keywordHits: hits.length,
+                });
             }
-            return fileKeywordFallback();
+            const fileHits = await fileKeywordFallback();
+            return finish(fileHits, `${fallbackFrom}_file_keyword`, {
+                keywordRows: rows.length,
+                fileHits: fileHits.length,
+            });
         };
 
         if (mode === 'keyword') {
-            return keywordFallback();
+            return keywordFallback('mode_keyword');
         }
 
         if (mode === 'fts') {
             const rows = await this.searchPgFtsUnified(query, scope.key, maxResults);
             if (rows.length === 0) {
-                return keywordFallback();
+                return keywordFallback('mode_fts_empty');
             }
-            return rows
+            const hits = rows
                 .map((row) => this.rowToHit(row, 'fts'))
                 .filter((item) => normalizeRankScore(item.score) >= minScore)
                 .map((item) => ({ ...item, score: normalizeRankScore(item.score) }))
                 .sort((a, b) => b.score - a.score)
                 .slice(0, maxResults);
+            return finish(hits, 'mode_fts', {
+                ftsRows: rows.length,
+                ftsHits: hits.length,
+            });
         }
 
         if (mode === 'vector') {
@@ -1133,64 +1481,366 @@ export class MemoryRuntime {
                 maxResults,
                 Math.floor(maxResults * this.memoryConfig.retrieval.hybrid_candidate_multiplier),
             );
-            const [vectorRows, sessionRows] = await Promise.all([
+            const [vectorRows, sessionRows, sessionVectorRows, temporalRows] = await Promise.all([
                 this.searchPgVector(query, scope.key, candidates),
                 this.searchPgSessionEventsFts(query, scope.key, candidates),
+                this.searchPgSessionEventsVector(query, scope.key, candidates),
+                this.searchPgSessionEventsTemporal(query, scope.key, candidates),
             ]);
-            if (vectorRows.length === 0) {
+            const mergedVectorRows = this.mergeRows([...vectorRows, ...sessionVectorRows], candidates);
+            const mergedSessionRows = this.mergeRows([...sessionRows, ...temporalRows], candidates);
+
+            if (mergedVectorRows.length === 0) {
                 const ftsRows = await this.searchPgFtsUnified(query, scope.key, maxResults);
                 if (ftsRows.length === 0) {
-                    return keywordFallback();
+                    return keywordFallback('mode_vector_empty');
                 }
-                return ftsRows
+                const hits = ftsRows
                     .map((row) => this.rowToHit(row, 'fts'))
                     .map((item) => ({ ...item, score: normalizeRankScore(item.score) }))
                     .filter((item) => item.score >= minScore)
                     .sort((a, b) => b.score - a.score)
                     .slice(0, maxResults);
+                return finish(hits, 'mode_vector_fallback_fts', {
+                    vectorRows: vectorRows.length,
+                    sessionVectorRows: sessionVectorRows.length,
+                    mergedVectorRows: mergedVectorRows.length,
+                    sessionFtsRows: sessionRows.length,
+                    temporalRows: temporalRows.length,
+                    ftsRows: ftsRows.length,
+                    hits: hits.length,
+                });
             }
 
-            if (sessionRows.length > 0) {
+            if (mergedSessionRows.length > 0) {
                 const merged = mergeHybrid(
-                    vectorRows,
-                    sessionRows,
+                    mergedVectorRows,
+                    mergedSessionRows,
                     this.memoryConfig.retrieval.hybrid_vector_weight,
                     this.memoryConfig.retrieval.hybrid_fts_weight,
                 ).map((item) => ({ ...item, strategy: 'vector' as const }));
-                return merged
+                const hits = merged
                     .filter((item) => item.score >= minScore)
                     .slice(0, maxResults);
+                return finish(hits, 'mode_vector_with_session_merge', {
+                    vectorRows: vectorRows.length,
+                    sessionVectorRows: sessionVectorRows.length,
+                    mergedVectorRows: mergedVectorRows.length,
+                    sessionFtsRows: sessionRows.length,
+                    temporalRows: temporalRows.length,
+                    mergedSessionRows: mergedSessionRows.length,
+                    hits: hits.length,
+                });
             }
 
-            return vectorRows
+            const hits = mergedVectorRows
                 .map((row) => this.rowToHit(row, 'vector'))
                 .filter((item) => item.score >= minScore)
                 .slice(0, maxResults);
+            return finish(hits, 'mode_vector_only', {
+                vectorRows: vectorRows.length,
+                sessionVectorRows: sessionVectorRows.length,
+                mergedVectorRows: mergedVectorRows.length,
+                sessionFtsRows: sessionRows.length,
+                temporalRows: temporalRows.length,
+                hits: hits.length,
+            });
         }
 
         const candidates = Math.max(
             maxResults,
             Math.floor(maxResults * this.memoryConfig.retrieval.hybrid_candidate_multiplier),
         );
-        const [ftsRows, vectorRows] = await Promise.all([
+        const [ftsRows, vectorRows, sessionVectorRows] = await Promise.all([
             this.searchPgFtsUnified(query, scope.key, candidates),
             this.searchPgVector(query, scope.key, candidates),
+            this.searchPgSessionEventsVector(query, scope.key, candidates),
         ]);
+        const mergedVectorRows = this.mergeRows([...vectorRows, ...sessionVectorRows], candidates);
 
-        if (vectorRows.length === 0 && ftsRows.length === 0) {
-            return keywordFallback();
+        if (mergedVectorRows.length === 0 && ftsRows.length === 0) {
+            return keywordFallback('mode_hybrid_empty');
         }
 
         const merged = mergeHybrid(
-            vectorRows,
+            mergedVectorRows,
             ftsRows,
             this.memoryConfig.retrieval.hybrid_vector_weight,
             this.memoryConfig.retrieval.hybrid_fts_weight,
         );
 
-        return merged
+        const hits = merged
             .filter((item) => item.score >= minScore)
             .slice(0, maxResults);
+        return finish(hits, 'mode_hybrid', {
+            ftsRows: ftsRows.length,
+            vectorRows: vectorRows.length,
+            sessionVectorRows: sessionVectorRows.length,
+            mergedVectorRows: mergedVectorRows.length,
+            hits: hits.length,
+        });
+    }
+
+    private logSearchTrace(params: {
+        scopeKey: string;
+        mode: AgentMemoryRetrievalMode;
+        query: string;
+        path: string;
+        candidates: Record<string, number>;
+        hits: MemorySearchHit[];
+        durationMs: number;
+        extra?: Record<string, string | number | boolean>;
+    }): void {
+        const sourceCounts: Record<string, number> = {};
+        const strategyCounts: Record<string, number> = {};
+        for (const hit of params.hits) {
+            sourceCounts[hit.source] = (sourceCounts[hit.source] ?? 0) + 1;
+            strategyCounts[hit.strategy] = (strategyCounts[hit.strategy] ?? 0) + 1;
+        }
+
+        const top = params.hits
+            .slice(0, 3)
+            .map((hit) => `${this.trimLogValue(hit.path, 56)}@${hit.score.toFixed(3)}`)
+            .join('|') || 'none';
+
+        const candidateSummary = this.summarizeCountMap(params.candidates);
+        const sourceSummary = this.summarizeCountMap(sourceCounts);
+        const strategySummary = this.summarizeCountMap(strategyCounts);
+        const extraSummary = params.extra ? this.summarizeExtraMap(params.extra) : 'none';
+
+        console.info(
+            `[Memory][Search] scope=${params.scopeKey} mode=${params.mode} path=${params.path} query="${this.trimLogValue(params.query, 80)}" durationMs=${params.durationMs} candidates={${candidateSummary}} hits=${params.hits.length} bySource={${sourceSummary}} byStrategy={${strategySummary}} extra={${extraSummary}} top={${top}}`
+        );
+    }
+
+    private summarizeCountMap(values: Record<string, number>): string {
+        const entries = Object.entries(values)
+            .filter(([, value]) => Number.isFinite(value) && value >= 0)
+            .sort((a, b) => b[1] - a[1]);
+        if (entries.length === 0) {
+            return 'none';
+        }
+        return entries.map(([key, value]) => `${key}:${value}`).join(',');
+    }
+
+    private summarizeExtraMap(values: Record<string, string | number | boolean>): string {
+        const entries = Object.entries(values);
+        if (entries.length === 0) {
+            return 'none';
+        }
+        return entries.map(([key, value]) => `${key}:${String(value)}`).join(',');
+    }
+
+    private trimLogValue(value: string, maxChars: number): string {
+        const normalized = value.replace(/\s+/g, ' ').trim();
+        if (normalized.length <= maxChars) {
+            return normalized;
+        }
+        return `${normalized.slice(0, Math.max(0, maxChars - 1))}…`;
+    }
+
+    async get(path: string, options: MemoryGetOptions | undefined, scope: MemoryScope): Promise<MemoryGetResult> {
+        const resolved = this.normalizeGetRequest(path, options);
+        if (!resolved.path) {
+            throw new Error('memory_get path is required');
+        }
+
+        if (resolved.path.startsWith('session_events/')) {
+            return this.readSessionEvent(resolved.path, resolved.range, scope);
+        }
+
+        return this.readMemoryFile(resolved.path, resolved.range, scope);
+    }
+
+    private normalizeGetRequest(
+        path: string,
+        options: MemoryGetOptions | undefined,
+    ): { path: string; range: { from: number; lines: number } } {
+        const rawPath = (path || '').trim();
+        let normalizedPath = rawPath
+            .replace(/^`+|`+$/g, '')
+            .trim();
+
+        if (/^\[.+\]$/u.test(normalizedPath)) {
+            normalizedPath = normalizedPath.slice(1, -1).trim();
+        }
+
+        let inferredFrom: number | undefined;
+        const lineSuffixMatch = normalizedPath.match(/^(.*):(\d+)(?::\d+)?$/u);
+        if (lineSuffixMatch) {
+            const basePath = lineSuffixMatch[1]?.trim() ?? '';
+            const fromLine = Number(lineSuffixMatch[2]);
+            if (basePath && Number.isSafeInteger(fromLine) && fromLine > 0) {
+                normalizedPath = basePath;
+                inferredFrom = fromLine;
+            }
+        }
+
+        const range = this.normalizeGetRange({
+            ...options,
+            from: options?.from ?? inferredFrom,
+        });
+        return {
+            path: normalizedPath,
+            range,
+        };
+    }
+
+    private normalizeGetRange(options?: MemoryGetOptions): { from: number; lines: number } {
+        const from = Math.max(1, Math.floor(options?.from ?? 1));
+        const requestedLines = Math.floor(options?.lines ?? DEFAULT_MEMORY_GET_LINES);
+        const lines = Math.max(1, Math.min(MAX_MEMORY_GET_LINES, requestedLines));
+        return { from, lines };
+    }
+
+    private splitLinesWithRange(
+        content: string,
+        range: { from: number; lines: number },
+    ): { text: string; fromLine: number; toLine: number; lineCount: number; truncated: boolean } {
+        const allLines = content.split('\n');
+        const fromIndex = Math.max(0, range.from - 1);
+        const picked = allLines.slice(fromIndex, fromIndex + range.lines);
+        const lineCount = picked.length;
+        const toLine = lineCount > 0 ? (range.from + lineCount - 1) : (range.from - 1);
+        const lineTruncated = fromIndex + range.lines < allLines.length;
+
+        let text = picked.join('\n');
+        let charTruncated = false;
+        if (text.length > MAX_MEMORY_GET_CHARS) {
+            text = `${text.slice(0, MAX_MEMORY_GET_CHARS - 1)}…`;
+            charTruncated = true;
+        }
+
+        return {
+            text,
+            fromLine: range.from,
+            toLine,
+            lineCount,
+            truncated: lineTruncated || charTruncated,
+        };
+    }
+
+    private resolveRequestedMemoryPath(path: string): { absPath: string; relPath: string } {
+        const absPath = path.startsWith('/')
+            ? resolve(path)
+            : resolve(this.workspacePath, path);
+        const relPath = normalizeRelPath(this.workspacePath, absPath);
+        if (!relPath || relPath.startsWith('..')) {
+            throw new Error('memory_get path is outside workspace');
+        }
+        return {
+            absPath,
+            relPath,
+        };
+    }
+
+    private isAllowedScopeMemoryPath(relPath: string, scope: MemoryScope): boolean {
+        const normalized = relPath.replace(/\\/g, '/');
+        if (!normalized.toLowerCase().endsWith('.md')) {
+            return false;
+        }
+
+        if (scope.key === 'main') {
+            if (normalized === 'MEMORY.md') {
+                return true;
+            }
+            if (/^memory\/[^/]+\.md$/u.test(normalized)) {
+                return true;
+            }
+            return normalized.startsWith('memory/scopes/main/');
+        }
+
+        const prefix = `memory/scopes/${scope.key}/`;
+        return normalized.startsWith(prefix);
+    }
+
+    private async readMemoryFile(
+        path: string,
+        range: { from: number; lines: number },
+        scope: MemoryScope,
+    ): Promise<MemoryGetResult> {
+        const resolved = this.resolveRequestedMemoryPath(path);
+        if (!this.isAllowedScopeMemoryPath(resolved.relPath, scope)) {
+            throw new Error(`memory_get path is not allowed for scope=${scope.key}: ${resolved.relPath}`);
+        }
+
+        const content = await readFile(resolved.absPath, 'utf-8').catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new Error(`memory_get failed to read file: ${message}`);
+        });
+
+        const chunk = this.splitLinesWithRange(content, range);
+        return {
+            path: resolved.relPath,
+            scope: scope.key,
+            source: inferSourceType(resolved.relPath),
+            fromLine: chunk.fromLine,
+            toLine: chunk.toLine,
+            lineCount: chunk.lineCount,
+            text: chunk.text,
+            truncated: chunk.truncated,
+        };
+    }
+
+    private parseSessionEventPath(path: string): { sessionKey: string; conversationId: string; eventId: number } | null {
+        const normalized = path.replace(/\\/g, '/');
+        const match = normalized.match(/^session_events\/([^/]+)\/(.+)\/event-(\d+)$/u);
+        if (!match) {
+            return null;
+        }
+
+        const sessionKey = match[1];
+        const conversationId = match[2];
+        const eventId = Number(match[3]);
+        if (!sessionKey || !conversationId || !Number.isSafeInteger(eventId) || eventId <= 0) {
+            return null;
+        }
+        return { sessionKey, conversationId, eventId };
+    }
+
+    private async readSessionEvent(
+        path: string,
+        range: { from: number; lines: number },
+        scope: MemoryScope,
+    ): Promise<MemoryGetResult> {
+        if (!this.pool || !this.canUsePg()) {
+            throw new Error('memory_get session event read requires PGSQL backend');
+        }
+
+        const parsed = this.parseSessionEventPath(path);
+        if (!parsed) {
+            throw new Error(`invalid session event path: ${path}`);
+        }
+        if (parsed.sessionKey !== scope.key) {
+            throw new Error(`cross-scope session event read is not allowed: ${parsed.sessionKey}`);
+        }
+
+        const result = await this.pool.query<SessionEventRow>(
+            `SELECT role, content
+             FROM ${this.sessionEventsTable}
+             WHERE id = $1
+               AND session_key = $2
+               AND conversation_id = $3
+             LIMIT 1`,
+            [parsed.eventId, parsed.sessionKey, parsed.conversationId]
+        );
+        const row = result.rows[0];
+        if (!row) {
+            throw new Error(`session event not found: ${path}`);
+        }
+
+        const content = `[${row.role}] ${row.content}`;
+        const chunk = this.splitLinesWithRange(content, range);
+        return {
+            path: path.replace(/\\/g, '/'),
+            scope: scope.key,
+            source: 'session',
+            fromLine: chunk.fromLine,
+            toLine: chunk.toLine,
+            lineCount: chunk.lineCount,
+            text: chunk.text,
+            truncated: chunk.truncated,
+        };
     }
 
     private shouldSearchSessionEvents(): boolean {
@@ -1233,30 +1883,71 @@ export class MemoryRuntime {
         };
     }
 
+    private buildLexicalSqlParts(columnSql: string, query: string, startParamIndex: number): {
+        whereSql: string;
+        scoreSql: string;
+        params: string[];
+    } | null {
+        const tokens = tokenizeLexicalQuery(query);
+        if (tokens.length === 0) {
+            return null;
+        }
+
+        const whereClauses: string[] = [];
+        const scoreClauses: string[] = [];
+        const params: string[] = [];
+        let index = startParamIndex;
+
+        for (const token of tokens) {
+            const rawParam = index;
+            index += 1;
+            const likeParam = index;
+            index += 1;
+
+            params.push(token, `%${escapeLikePattern(token)}%`);
+            whereClauses.push(`${columnSql} ILIKE $${likeParam}`);
+            scoreClauses.push(
+                `CASE
+                    WHEN position(lower($${rawParam}) in lower(${columnSql})) > 0
+                    THEN 1.0 / (1 + position(lower($${rawParam}) in lower(${columnSql})))
+                    ELSE 0
+                 END`
+            );
+        }
+
+        return {
+            whereSql: `(${whereClauses.join(' OR ')})`,
+            scoreSql: `GREATEST(${scoreClauses.join(', ')})`,
+            params,
+        };
+    }
+
     private async searchPgKeywordUnified(query: string, scopeKey: string, limit: number): Promise<SearchRow[]> {
-        const [chunkRows, sessionRows] = await Promise.all([
+        const [chunkRows, sessionRows, temporalRows] = await Promise.all([
             this.searchPgKeyword(query, scopeKey, limit),
             this.searchPgSessionEventsKeyword(query, scopeKey, limit),
+            this.searchPgSessionEventsTemporal(query, scopeKey, limit),
         ]);
-        return this.mergeRows([...chunkRows, ...sessionRows], limit);
+        return this.mergeRows([...chunkRows, ...sessionRows, ...temporalRows], limit);
     }
 
     private async searchPgKeyword(query: string, scopeKey: string, limit: number): Promise<SearchRow[]> {
         if (!this.pool) return [];
 
+        const lexical = this.buildLexicalSqlParts('content', query, 3);
+        if (!lexical) {
+            return [];
+        }
+
         const result = await this.pool.query<SearchRow>(
             `SELECT rel_path, chunk_index, start_line, end_line, content, source_type,
-                    CASE
-                        WHEN position(lower($2) in lower(content)) > 0
-                        THEN 1.0 / (1 + position(lower($2) in lower(content)))
-                        ELSE 0
-                    END AS score
+                    ${lexical.scoreSql} AS score
              FROM ${this.chunksTable}
              WHERE scope_key = $1
-               AND content ILIKE '%' || $2 || '%'
+               AND ${lexical.whereSql}
              ORDER BY score DESC, updated_at DESC
-             LIMIT $3`,
-            [scopeKey, query, limit]
+             LIMIT $2`,
+            [scopeKey, limit, ...lexical.params]
         );
 
         return result.rows;
@@ -1268,6 +1959,10 @@ export class MemoryRuntime {
         }
 
         const sessionLimit = this.getSessionEventsLimit(limit);
+        const lexical = this.buildLexicalSqlParts('content', query, 3);
+        if (!lexical) {
+            return [];
+        }
         try {
             const result = await this.pool.query<SearchRow>(
                 `SELECT
@@ -1277,17 +1972,13 @@ export class MemoryRuntime {
                     1 AS end_line,
                     ('[' || role || '] ' || content) AS content,
                     'session'::text AS source_type,
-                    CASE
-                        WHEN position(lower($2) in lower(content)) > 0
-                        THEN 1.0 / (1 + position(lower($2) in lower(content)))
-                        ELSE 0
-                    END AS score
+                    ${lexical.scoreSql} AS score
                  FROM ${this.sessionEventsTable}
                  WHERE session_key = $1
-                   AND content ILIKE '%' || $2 || '%'
+                   AND ${lexical.whereSql}
                  ORDER BY score DESC, created_at DESC
-                 LIMIT $3`,
-                [scopeKey, query, sessionLimit]
+                 LIMIT $2`,
+                [scopeKey, sessionLimit, ...lexical.params]
             );
             return result.rows;
         } catch (error) {
@@ -1297,15 +1988,21 @@ export class MemoryRuntime {
     }
 
     private async searchPgFtsUnified(query: string, scopeKey: string, limit: number): Promise<SearchRow[]> {
-        const [chunkRows, sessionRows] = await Promise.all([
+        const [chunkRows, sessionRows, temporalRows] = await Promise.all([
             this.searchPgFts(query, scopeKey, limit),
             this.searchPgSessionEventsFts(query, scopeKey, limit),
+            this.searchPgSessionEventsTemporal(query, scopeKey, limit),
         ]);
-        return this.mergeRows([...chunkRows, ...sessionRows], limit);
+        return this.mergeRows([...chunkRows, ...sessionRows, ...temporalRows], limit);
     }
 
     private async searchPgFts(query: string, scopeKey: string, limit: number): Promise<SearchRow[]> {
         if (!this.pool) return [];
+
+        const ftsQuery = buildFtsQueryText(query);
+        if (!ftsQuery) {
+            return this.searchPgKeyword(query, scopeKey, limit);
+        }
 
         try {
             const result = await this.pool.query<SearchRow>(
@@ -1316,7 +2013,7 @@ export class MemoryRuntime {
                    AND search_vector @@ websearch_to_tsquery('simple', $2)
                  ORDER BY score DESC, updated_at DESC
                  LIMIT $3`,
-                [scopeKey, query, limit]
+                [scopeKey, ftsQuery, limit]
             );
 
             if (result.rows.length > 0) {
@@ -1335,6 +2032,10 @@ export class MemoryRuntime {
         }
 
         const sessionLimit = this.getSessionEventsLimit(limit);
+        const ftsQuery = buildFtsQueryText(query);
+        if (!ftsQuery) {
+            return this.searchPgSessionEventsKeyword(query, scopeKey, limit);
+        }
         try {
             const result = await this.pool.query<SearchRow>(
                 `SELECT
@@ -1350,7 +2051,7 @@ export class MemoryRuntime {
                    AND to_tsvector('simple', content) @@ websearch_to_tsquery('simple', $2)
                  ORDER BY score DESC, created_at DESC
                  LIMIT $3`,
-                [scopeKey, query, sessionLimit]
+                [scopeKey, ftsQuery, sessionLimit]
             );
 
             if (result.rows.length > 0) {
@@ -1364,12 +2065,183 @@ export class MemoryRuntime {
         return this.searchPgSessionEventsKeyword(query, scopeKey, limit);
     }
 
-    private handleSessionSearchError(error: unknown, mode: 'keyword' | 'fts'): void {
+    private hasTemporalRecallIntent(query: string): boolean {
+        return /(昨天|昨日|前天|今天|上次|之前|先前|历史|聊过|问过|还记得|刚才|刚刚)/u.test(query);
+    }
+
+    private resolveTemporalWindow(query: string): { startMs: number; endMs: number } | null {
+        if (!this.hasTemporalRecallIntent(query)) {
+            return null;
+        }
+        const now = Date.now();
+        const current = new Date(now);
+        const startToday = new Date(current.getFullYear(), current.getMonth(), current.getDate()).getTime();
+
+        if (/前天/u.test(query)) {
+            return {
+                startMs: startToday - (2 * ONE_DAY_MS),
+                endMs: startToday - ONE_DAY_MS,
+            };
+        }
+        if (/(昨天|昨日)/u.test(query)) {
+            return {
+                startMs: startToday - ONE_DAY_MS,
+                endMs: startToday,
+            };
+        }
+        if (/今天/u.test(query)) {
+            return {
+                startMs: startToday,
+                endMs: now + 1,
+            };
+        }
+        return {
+            startMs: now - (TEMPORAL_RECENT_DAYS * ONE_DAY_MS),
+            endMs: now + 1,
+        };
+    }
+
+    private queryPrefersUserRole(query: string): boolean {
+        return /(我问|问了什么|问过|提过|历史问题|我说过)/u.test(query);
+    }
+
+    private async searchPgSessionEventsTemporal(query: string, scopeKey: string, limit: number): Promise<SearchRow[]> {
+        if (!this.pool || !this.shouldSearchSessionEvents()) {
+            return [];
+        }
+        if (!this.hasTemporalRecallIntent(query)) {
+            return [];
+        }
+
+        const window = this.resolveTemporalWindow(query);
+        if (!window) {
+            return [];
+        }
+        const prefersUser = this.queryPrefersUserRole(query);
+        const candidateLimit = Math.max(limit * 5, 30);
+        try {
+            const result = await this.pool.query<SessionEventSearchRow>(
+                `SELECT id, session_key, conversation_id, role, content, created_at
+                 FROM ${this.sessionEventsTable}
+                 WHERE session_key = $1
+                   AND created_at >= $2
+                   AND created_at < $3
+                 ORDER BY created_at DESC
+                 LIMIT $4`,
+                [scopeKey, window.startMs, window.endMs, candidateLimit]
+            );
+            if (result.rows.length === 0) {
+                return [];
+            }
+
+            const ranked = result.rows.map((row, index) => {
+                const content = `[${row.role}] ${row.content}`;
+                const normQuery = query.toLowerCase();
+                const normContent = content.toLowerCase();
+                const pos = normContent.indexOf(normQuery);
+                const lexicalScore = pos >= 0 ? (1 / (1 + pos)) : 0;
+                const keywordHint = (/(问|问题)/u.test(query) && /(问|问题)/u.test(content)) ? 0.25 : 0;
+                const recencyScore = Math.max(0, 1 - (index / Math.max(1, result.rows.length)));
+                const roleBoost = prefersUser && row.role === 'user' ? 0.25 : 0;
+                const score = Math.min(1, (0.55 * recencyScore) + (0.35 * lexicalScore) + keywordHint + roleBoost);
+                return {
+                    row,
+                    score,
+                };
+            });
+
+            ranked.sort((a, b) => {
+                if (b.score !== a.score) {
+                    return b.score - a.score;
+                }
+                return Number(b.row.created_at) - Number(a.row.created_at);
+            });
+
+            const finalRows = prefersUser
+                ? ranked.sort((a, b) => {
+                    const aUser = a.row.role === 'user' ? 1 : 0;
+                    const bUser = b.row.role === 'user' ? 1 : 0;
+                    if (bUser !== aUser) {
+                        return bUser - aUser;
+                    }
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+                    return Number(b.row.created_at) - Number(a.row.created_at);
+                })
+                : ranked;
+
+            return finalRows
+                .slice(0, this.getSessionEventsLimit(limit))
+                .map(({ row, score }) => ({
+                    rel_path: `session_events/${row.session_key}/${row.conversation_id}/event-${row.id}`,
+                    chunk_index: 0,
+                    start_line: 1,
+                    end_line: 1,
+                    content: `[${row.role}] ${row.content}`,
+                    source_type: 'session' as const,
+                    score,
+                }));
+        } catch (error) {
+            this.handleSessionSearchError(error, 'keyword');
+            return [];
+        }
+    }
+
+    private async searchPgSessionEventsVector(query: string, scopeKey: string, limit: number): Promise<SearchRow[]> {
+        if (
+            !this.pool
+            || !this.shouldSearchSessionEvents()
+            || !this.memoryConfig.embedding.enabled
+            || !this.vectorAvailable
+            || !this.sessionEventVectorAvailable
+        ) {
+            return [];
+        }
+
+        const queryEmbedding = await this.getOrCreateEmbedding(query, sha256(`session-query:${query}`));
+        if (!queryEmbedding || queryEmbedding.length === 0) {
+            return [];
+        }
+
+        const sessionLimit = this.getSessionEventsLimit(limit);
+
+        try {
+            const result = await this.pool.query<SearchRow>(
+                `SELECT
+                    ('session_events/' || session_key || '/' || conversation_id || '/event-' || id::text) AS rel_path,
+                    0 AS chunk_index,
+                    1 AS start_line,
+                    1 AS end_line,
+                    ('[' || role || '] ' || content) AS content,
+                    'session'::text AS source_type,
+                    (1 - (embedding <=> $2::vector)) AS score
+                 FROM ${this.sessionEventsTable}
+                 WHERE session_key = $1
+                   AND embedding IS NOT NULL
+                 ORDER BY embedding <=> $2::vector ASC, created_at DESC
+                 LIMIT $3`,
+                [scopeKey, toVectorLiteral(queryEmbedding), sessionLimit]
+            );
+            return result.rows;
+        } catch (error) {
+            this.handleSessionSearchError(error, 'vector');
+            return [];
+        }
+    }
+
+    private handleSessionSearchError(error: unknown, mode: 'keyword' | 'fts' | 'vector'): void {
         const code = typeof error === 'object' && error !== null && 'code' in error
             ? String((error as { code?: unknown }).code ?? '')
             : '';
         if (code === '42P01' || code === '42703') {
             this.sessionEventsAvailable = false;
+            this.sessionEventVectorAvailable = false;
+            this.stopBackgroundWorkers();
+        }
+        if (mode === 'vector' && (code === '42883' || code === '22P02' || code === 'XX000')) {
+            this.sessionEventVectorAvailable = false;
+            this.stopSessionEventEmbeddingWorker();
         }
         console.warn(`[Memory] session event ${mode} search failed:`, error instanceof Error ? error.message : String(error));
     }

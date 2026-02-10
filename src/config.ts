@@ -67,6 +67,11 @@ export interface AgentMemoryRetrievalConfig {
     hybrid_candidate_multiplier: number;
     include_session_events: boolean;
     session_events_max_results: number;
+    session_events_vector_async_enabled: boolean;
+    session_events_vector_async_interval_ms: number;
+    session_events_vector_async_batch_size: number;
+    session_events_ttl_days: number;
+    session_events_ttl_cleanup_interval_ms: number;
 }
 
 export interface AgentMemoryEmbeddingProviderConfig {
@@ -219,6 +224,7 @@ export interface DingTalkConfig {
         defaultTarget?: string;
         useMarkdown?: boolean;
         title?: string;
+        autoMemorySaveAt4?: boolean;
     };
 }
 
@@ -306,6 +312,11 @@ const DEFAULT_CONFIG = {
                 hybrid_candidate_multiplier: 2,
                 include_session_events: true,
                 session_events_max_results: 6,
+                session_events_vector_async_enabled: true,
+                session_events_vector_async_interval_ms: 5000,
+                session_events_vector_async_batch_size: 16,
+                session_events_ttl_days: 30,
+                session_events_ttl_cleanup_interval_ms: 10 * 60 * 1000,
             },
             embedding: {
                 enabled: false,
@@ -764,6 +775,24 @@ export function loadConfig(): Config {
     config.agent.memory.retrieval.session_events_max_results = Math.max(
         1,
         Math.floor(config.agent.memory.retrieval.session_events_max_results)
+    );
+    config.agent.memory.retrieval.session_events_vector_async_enabled =
+        config.agent.memory.retrieval.session_events_vector_async_enabled !== false;
+    config.agent.memory.retrieval.session_events_vector_async_interval_ms = Math.max(
+        1000,
+        Math.floor(config.agent.memory.retrieval.session_events_vector_async_interval_ms)
+    );
+    config.agent.memory.retrieval.session_events_vector_async_batch_size = Math.max(
+        1,
+        Math.floor(config.agent.memory.retrieval.session_events_vector_async_batch_size)
+    );
+    config.agent.memory.retrieval.session_events_ttl_days = Math.max(
+        0,
+        Math.floor(config.agent.memory.retrieval.session_events_ttl_days)
+    );
+    config.agent.memory.retrieval.session_events_ttl_cleanup_interval_ms = Math.max(
+        60_000,
+        Math.floor(config.agent.memory.retrieval.session_events_ttl_cleanup_interval_ms)
     );
     config.agent.memory.transcript.max_chars_per_entry = Math.max(
         200,

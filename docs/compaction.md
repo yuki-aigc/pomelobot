@@ -1,10 +1,9 @@
 # Compaction 机制说明（Pomelobot）
 
-本文参考 OpenClaw Compaction 概念文档结构，结合当前仓库实现，说明 Pomelobot 的上下文压缩机制、触发策略、执行流程与运维建议。
+> 本文档说明 Pomelobot 的上下文压缩机制、触发策略、执行流程与运维建议。
 
 参考：
 - [OpenClaw Compaction](https://docs.openclaw.ai/zh-CN/concepts/compaction)
-- [OpenClaw Memory](https://docs.openclaw.ai/zh-CN/concepts/memory)
 - [Memory + Compaction 流程图](./architecture-memory-compaction.md)
 
 ---
@@ -119,7 +118,7 @@ CLI 支持：
 ### 5.2 压缩后还能不能追溯
 
 可以，但要区分两种来源：
-- 知识型记忆：`memory_search`（chunks + session events）
+- 知识型记忆：`memory_search`（chunks + session events）+ `memory_get`（按路径精读）
 - 会话态恢复：`dingtalk_sessions` / `dingtalk_session_events`
 
 ---

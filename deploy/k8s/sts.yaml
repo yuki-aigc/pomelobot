@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pomelobot-postgres
+  labels:
+    app: pomelobot-postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pomelobot-postgres
+  template:
+    metadata:
+      labels:
+        app: pomelobot-postgres
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              value: "pomelobot"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pomelobot-postgres-secret
+                  key: password
+            - name: POSTGRES_DB
+              value: "pomelobot"
+            - name: TZ
+              value: "Asia/Shanghai"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - pomelobot
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - pomelobot
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1024Mi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: pomelobot-postgres
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: pomelobot-postgres
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pomelobot-postgres-secret
+type: Opaque
+stringData:
+  password: "Admin@123"

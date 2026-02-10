@@ -48,6 +48,151 @@ const colors = {
 
 // Cache discovered group conversation IDs to avoid noisy duplicate logs.
 const seenGroupConversations = new Map<string, string>();
+const AUTO_MEMORY_SAVE_JOB_NAME = '系统任务：每日记忆归档(04:00)';
+const AUTO_MEMORY_SAVE_JOB_MARKER = '[system:auto-memory-save-4am:v1]';
+const AUTO_MEMORY_SAVE_JOB_CRON_EXPR = '0 4 * * *';
+
+function buildAutoMemorySaveJobDescription(): string {
+    return `自动创建，请勿删除。${AUTO_MEMORY_SAVE_JOB_MARKER}`;
+}
+
+function buildAutoMemorySaveJobPrompt(): string {
+    return [
+        '请执行每日记忆归档任务。',
+        '要求：',
+        '1. 回顾最近24小时对话中的关键事实、告警分析、定位结论、处置动作、遗留风险与待办。',
+        '2. 调用 memory_save，target 必须是 daily；内容需要结构化且可复盘。',
+        '3. 完成后在回复末尾明确输出: memory_saved。',
+        '注意：若你没有调用 memory_save 就结束任务，视为失败。',
+    ].join('\n');
+}
+
+function isAutoMemorySaveJob(job: CronJob): boolean {
+    const description = job.description || '';
+    if (description.includes(AUTO_MEMORY_SAVE_JOB_MARKER)) {
+        return true;
+    }
+    return job.name === AUTO_MEMORY_SAVE_JOB_NAME;
+}
+
+async function ensureAutoMemorySaveJob(params: {
+    cronService: CronService;
+    config: ReturnType<typeof loadConfig>;
+    log: Logger;
+}): Promise<void> {
+    const { cronService, config, log } = params;
+    if (!config.cron.enabled) {
+        return;
+    }
+    if (config.dingtalk?.cron?.autoMemorySaveAt4 === false) {
+        return;
+    }
+
+    const defaultTarget = config.dingtalk?.cron?.defaultTarget?.trim();
+    if (!defaultTarget) {
+        log.warn('[Cron] skip auto memory-save(04:00): dingtalk.cron.defaultTarget is empty');
+        return;
+    }
+
+    const desiredDescription = buildAutoMemorySaveJobDescription();
+    const desiredPrompt = buildAutoMemorySaveJobPrompt();
+    const desiredTimezone = config.cron.timezone;
+    const desiredUseMarkdown = config.dingtalk?.cron?.useMarkdown ?? true;
+    const desiredTitle = config.dingtalk?.cron?.title || '每日记忆归档';
+
+    const jobs = await cronService.listJobs();
+    const matched = jobs.filter((job) => isAutoMemorySaveJob(job));
+    const primary = matched[0];
+
+    if (!primary) {
+        const created = await cronService.addJob({
+            name: AUTO_MEMORY_SAVE_JOB_NAME,
+            description: desiredDescription,
+            enabled: true,
+            schedule: {
+                kind: 'cron',
+                expr: AUTO_MEMORY_SAVE_JOB_CRON_EXPR,
+                timezone: desiredTimezone,
+            },
+            payload: {
+                message: desiredPrompt,
+            },
+            delivery: {
+                target: defaultTarget,
+                title: desiredTitle,
+                useMarkdown: desiredUseMarkdown,
+            },
+        });
+        log.info(`[Cron] ensured auto memory-save job created: ${created.id}`);
+        return;
+    }
+
+    if (matched.length > 1) {
+        for (const duplicate of matched.slice(1)) {
+            await cronService.deleteJob(duplicate.id);
+            log.info(`[Cron] removed duplicate auto memory-save job: ${duplicate.id}`);
+        }
+    }
+
+    let needsUpdate = false;
+    const patch: {
+        name?: string;
+        description?: string;
+        enabled?: boolean;
+        schedule?: { kind: 'cron'; expr: string; timezone?: string };
+        payload?: { message?: string };
+        delivery?: { target?: string; title?: string; useMarkdown?: boolean };
+    } = {};
+
+    if (primary.name !== AUTO_MEMORY_SAVE_JOB_NAME) {
+        patch.name = AUTO_MEMORY_SAVE_JOB_NAME;
+        needsUpdate = true;
+    }
+    if ((primary.description || '') !== desiredDescription) {
+        patch.description = desiredDescription;
+        needsUpdate = true;
+    }
+    if (!primary.enabled) {
+        patch.enabled = true;
+        needsUpdate = true;
+    }
+    if (
+        primary.schedule.kind !== 'cron'
+        || primary.schedule.expr !== AUTO_MEMORY_SAVE_JOB_CRON_EXPR
+        || (primary.schedule.timezone || undefined) !== (desiredTimezone || undefined)
+    ) {
+        patch.schedule = {
+            kind: 'cron',
+            expr: AUTO_MEMORY_SAVE_JOB_CRON_EXPR,
+            timezone: desiredTimezone,
+        };
+        needsUpdate = true;
+    }
+    if ((primary.payload.message || '').trim() !== desiredPrompt) {
+        patch.payload = { message: desiredPrompt };
+        needsUpdate = true;
+    }
+
+    const shouldPatchDelivery =
+        (primary.delivery.target || '').trim() !== defaultTarget
+        || (primary.delivery.title || '') !== desiredTitle
+        || (primary.delivery.useMarkdown ?? true) !== desiredUseMarkdown;
+    if (shouldPatchDelivery) {
+        patch.delivery = {
+            target: defaultTarget,
+            title: desiredTitle,
+            useMarkdown: desiredUseMarkdown,
+        };
+        needsUpdate = true;
+    }
+
+    if (needsUpdate) {
+        const updated = await cronService.updateJob(primary.id, patch);
+        log.info(`[Cron] ensured auto memory-save job updated: ${updated.id}`);
+    } else {
+        log.info(`[Cron] ensured auto memory-save job exists: ${primary.id}`);
+    }
+}
 
 /**
  * Create logger for DingTalk channel
@@ -320,6 +465,13 @@ async function main() {
         },
     });
     await cronService.start();
+    await ensureAutoMemorySaveJob({
+        cronService,
+        config,
+        log,
+    }).catch((error) => {
+        log.warn('[Cron] ensure auto memory-save job failed:', error instanceof Error ? error.message : String(error));
+    });
     setCronService(cronService);
 
     // Register message callback
