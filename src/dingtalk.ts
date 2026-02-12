@@ -123,6 +123,7 @@ async function ensureAutoMemorySaveJob(params: {
                 message: desiredPrompt,
             },
             delivery: {
+                channel: 'dingtalk',
                 target: defaultTarget,
                 title: desiredTitle,
                 useMarkdown: desiredUseMarkdown,
@@ -146,7 +147,7 @@ async function ensureAutoMemorySaveJob(params: {
         enabled?: boolean;
         schedule?: { kind: 'cron'; expr: string; timezone?: string };
         payload?: { message?: string };
-        delivery?: { target?: string; title?: string; useMarkdown?: boolean };
+        delivery?: { channel?: string; target?: string; title?: string; useMarkdown?: boolean };
     } = {};
 
     if (primary.name !== AUTO_MEMORY_SAVE_JOB_NAME) {
@@ -179,11 +180,13 @@ async function ensureAutoMemorySaveJob(params: {
     }
 
     const shouldPatchDelivery =
-        (primary.delivery.target || '').trim() !== defaultTarget
+        (primary.delivery.channel || 'dingtalk') !== 'dingtalk'
+        || (primary.delivery.target || '').trim() !== defaultTarget
         || (primary.delivery.title || '') !== desiredTitle
         || (primary.delivery.useMarkdown ?? true) !== desiredUseMarkdown;
     if (shouldPatchDelivery) {
         patch.delivery = {
+            channel: 'dingtalk',
             target: defaultTarget,
             title: desiredTitle,
             useMarkdown: desiredUseMarkdown,
@@ -284,6 +287,10 @@ function extractAgentResponseText(result: unknown): string {
         return '';
     }
     return extractTextContent(lastMessage.content);
+}
+
+function buildCronDeliveryChannel(job: CronJob): string {
+    return job.delivery.channel?.trim().toLowerCase() || 'dingtalk';
 }
 
 function buildCronDeliveryTarget(job: CronJob, config: ReturnType<typeof loadConfig>): string | undefined {
@@ -452,6 +459,7 @@ export async function startDingTalkService(options?: {
         storePath: resolveCronStorePath(config.cron.store),
         runLogPath: config.cron.runLog,
         defaultDelivery: {
+            channel: 'dingtalk',
             target: dingtalkConfig.cron?.defaultTarget,
             useMarkdown: dingtalkConfig.cron?.useMarkdown,
             title: dingtalkConfig.cron?.title,
@@ -463,6 +471,14 @@ export async function startDingTalkService(options?: {
             error: (message: string, ...args: unknown[]) => log.error(message, ...args),
         },
         runJob: async (job) => {
+            const deliveryChannel = buildCronDeliveryChannel(job);
+            if (deliveryChannel !== 'dingtalk') {
+                return {
+                    status: 'skipped',
+                    error: `任务 ${job.id} 配置 channel=${deliveryChannel}，当前实例仅处理 dingtalk`,
+                };
+            }
+
             const target = buildCronDeliveryTarget(job, config);
             if (!target) {
                 return {
@@ -519,6 +535,7 @@ export async function startDingTalkService(options?: {
     }).catch((error) => {
         log.warn('[Cron] ensure auto memory-save job failed:', error instanceof Error ? error.message : String(error));
     });
+    setCronService('dingtalk', cronService);
     setCronService(cronService);
 
     gateway = new GatewayService({
@@ -650,7 +667,7 @@ export async function startDingTalkService(options?: {
             } catch (error) {
                 log.warn('[DingTalk] cron service stop failed:', error instanceof Error ? error.message : String(error));
             }
-            setCronService(null);
+            setCronService('dingtalk', null);
         }
 
         try {

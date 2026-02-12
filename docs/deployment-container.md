@@ -48,7 +48,7 @@ Dockerfile 默认：
 pnpm start:server
 ```
 
-即运行多渠道统一入口（当前已实现 dingtalk）。
+即运行多渠道统一入口（当前已实现 dingtalk + ios）。
 
 ## 4. K8s 部署要点
 

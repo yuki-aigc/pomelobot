@@ -1,5 +1,6 @@
 import { loadConfig } from './config.js';
 import { startDingTalkService } from './dingtalk.js';
+import { startIOSService } from './ios.js';
 import { createRuntimeLogWriter } from './log/runtime.js';
 
 const colors = {
@@ -15,12 +16,15 @@ type RunningChannelService = {
     shutdown: () => Promise<void>;
 };
 
-const SUPPORTED_CHANNELS = new Set(['dingtalk']);
+const SUPPORTED_CHANNELS = new Set(['dingtalk', 'ios']);
 
 function resolveConfiguredChannels(config: ReturnType<typeof loadConfig>): string[] {
     const channels: string[] = [];
     if (config.dingtalk?.enabled) {
         channels.push('dingtalk');
+    }
+    if (config.ios?.enabled) {
+        channels.push('ios');
     }
     return channels;
 }
@@ -52,6 +56,7 @@ export async function startServer(): Promise<void> {
     const requestedChannels = parseRequestedChannels(config);
     const serverLogWriter = createRuntimeLogWriter({ prefix: 'server' });
     const dingtalkLogWriter = createRuntimeLogWriter({ prefix: 'dingtalk-server' });
+    const iosLogWriter = createRuntimeLogWriter({ prefix: 'ios-server' });
 
     const logInfo = (message: string, ...args: unknown[]) => {
         serverLogWriter.write('INFO', message, args);
@@ -73,6 +78,7 @@ export async function startServer(): Promise<void> {
     try {
         logInfo(`[Server] logs -> ${serverLogWriter.filePath}`);
         logInfo(`[Server] dingtalk logs -> ${dingtalkLogWriter.filePath}`);
+        logInfo(`[Server] ios logs -> ${iosLogWriter.filePath}`);
 
         if (requestedChannels.length === 0) {
             throw new Error('未找到可启动渠道。请检查 config.json 中各渠道 enabled，或设置 CHANNELS 环境变量。');
@@ -101,6 +107,23 @@ export async function startServer(): Promise<void> {
                     shutdown: runtime.shutdown,
                 });
                 logInfo('[Server] channel started: dingtalk');
+                continue;
+            }
+
+            if (channel === 'ios') {
+                if (!config.ios?.enabled) {
+                    throw new Error('请求启动 ios，但 config.ios.enabled=false');
+                }
+                const runtime = await startIOSService({
+                    registerSignalHandlers: false,
+                    exitOnShutdown: false,
+                    logWriter: iosLogWriter,
+                });
+                running.push({
+                    channel: 'ios',
+                    shutdown: runtime.shutdown,
+                });
+                logInfo('[Server] channel started: ios');
             }
         }
 
@@ -128,6 +151,7 @@ export async function startServer(): Promise<void> {
             await Promise.all([
                 serverLogWriter.close().catch(() => undefined),
                 dingtalkLogWriter.close().catch(() => undefined),
+                iosLogWriter.close().catch(() => undefined),
             ]);
 
             process.exit(hasError ? 1 : 0);
@@ -146,6 +170,7 @@ export async function startServer(): Promise<void> {
         await Promise.all([
             serverLogWriter.close().catch(() => undefined),
             dingtalkLogWriter.close().catch(() => undefined),
+            iosLogWriter.close().catch(() => undefined),
         ]);
         throw error;
     }
