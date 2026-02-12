@@ -17,8 +17,6 @@
   - `getChannelConversationContext`
   - `queueChannelReplyFile` / `consumeQueuedChannelReplyFiles`
 
-该上下文是 channel 无关抽象，后续所有渠道复用。
-
 ### 2.2 网关抽象
 
 - 文件：`src/channels/gateway/types.ts`
@@ -32,42 +30,57 @@
   - `GatewayService.dispatchInbound`（含幂等去重）
   - `GatewayService.sendProactive`
 
-### 2.3 DingTalk Adapter
+### 2.3 DingTalk Adapter（保持原行为）
 
 - 文件：`src/channels/dingtalk/adapter.ts`
-- 状态：skeleton 已接入
+- 状态：已接入
   - `sendReply` -> `sendBySession`
   - `sendProactive` -> `sendProactiveMessage`
   - `handleInbound` -> 交给 `GatewayService`
 
-### 2.4 DingTalk 主流程接入网关
+### 2.4 iOS WebSocket Adapter（新增）
 
-- 文件：`src/dingtalk.ts`
+- 文件：`src/channels/ios/adapter.ts`
+- 能力：
+  - 内置 WS Server（`host/port/path` 可配置）
+  - 支持 `hello` / `message` / `ping` 协议
+  - `sendReply`：优先按连接回包，回退按会话/用户路由
+  - `sendProactive`：支持 `conversation:<id>` / `user:<id>` / `connection:<id>`
+
+### 2.5 Cron 渠道隔离（新增）
+
+- 文件：`src/cron/runtime.ts`
+- 能力：
+  - 从单例升级为“按渠道注册 cron service”
+  - `getCronService(channel?)` 按当前会话渠道取对应实例
+- 文件：`src/cron/tools.ts`
+  - `cron_job_add/update` 新增 `channel` 字段
+  - 默认从当前会话推断 `channel + target`
+
+### 2.6 统一服务端注册
+
+- 文件：`src/server.ts`
 - 变化：
-  - `TOPIC_ROBOT` 回调改为 `dingtalkAdapter.handleInbound(...)`
-  - 网关 `onProcessInbound` 里仍调用原 `handleMessage(...)`
-  - `TOPIC_CARD` 审批回调维持原路径
-
-这意味着行为不变，但接入面已标准化。
+  - `SUPPORTED_CHANNELS = dingtalk + ios`
+  - 可通过 `CHANNELS=dingtalk,ios` 同时启动多渠道
+  - 按渠道输出独立日志文件
 
 ## 3. 启动模型
 
-### 3.1 单渠道（DingTalk）
+### 3.1 单渠道
 
 ```bash
 pnpm dingtalk
+pnpm ios
 ```
 
 ### 3.2 统一服务端（多渠道入口）
 
 ```bash
 pnpm run server
-```
-
-可通过 `CHANNELS` 指定渠道集合：
-
-```bash
 CHANNELS=dingtalk pnpm run server
+CHANNELS=ios pnpm run server
+CHANNELS=dingtalk,ios pnpm run server
 ```
 
 ## 4. 日志
@@ -76,18 +89,33 @@ CHANNELS=dingtalk pnpm run server
 
 - `logs/server-YYYY-MM-DD.log`：网关/服务端日志
 - `logs/dingtalk-server-YYYY-MM-DD.log`：DingTalk 通道日志
+- `logs/ios-server-YYYY-MM-DD.log`：iOS 通道日志
 
-## 5. 新增渠道接入步骤（建议）
+## 5. iOS 协议约定
 
-以“飞书”或“iOS WS”为例：
+客户端 -> 服务端：
+
+- `hello`：会话初始化，可带 `token`
+- `message`：用户消息，核心字段 `text`
+- `ping`：心跳
+
+服务端 -> 客户端：
+
+- `hello_ack`
+- `reply`
+- `proactive`
+- `dispatch_ack`
+
+## 6. 新增渠道接入步骤（建议）
 
 1. 新建 `src/channels/<channel>/adapter.ts` 并实现 `ChannelAdapter`
 2. 解析渠道原始消息为 `ChannelInboundMessage`
 3. 实现 `sendReply` / `sendProactive`
-4. 在 `src/server.ts` 中注册并启动 adapter
-5. 补充渠道配置项与 README 文档
+4. 在 `src/server.ts` 中注册并启动该 adapter
+5. 在 `src/cron/runtime.ts` 注册该渠道 cron service
+6. 补充渠道配置项与 README 文档
 
-## 6. 约束与建议
+## 7. 约束与建议
 
 - 幂等键建议优先使用渠道原生 message id，避免重放造成重复执行
 - 非 DingTalk 渠道建议自定义 session scope 前缀，避免记忆串线

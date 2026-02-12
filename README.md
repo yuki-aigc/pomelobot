@@ -29,7 +29,7 @@
 | 🛠️ **技能系统** | 以 `SKILL.md` 定义技能，动态加载并通过子代理协作 |
 | 🔌 **MCP 集成** | 通过 `@langchain/mcp-adapters` 挂载 MCP 工具（stdio / http / sse） |
 | 🤖 **多模型支持** | OpenAI / Anthropic（多模型配置池，运行时 `/model` 热切换） |
-| 🌉 **渠道网关** | 引入 `GatewayService + ChannelAdapter` 抽象，已接入 DingTalk，支持后续扩展 iOS / 飞书 / 安卓等渠道 |
+| 🌉 **渠道网关** | 引入 `GatewayService + ChannelAdapter` 抽象，已接入 DingTalk + iOS WebSocket，支持后续扩展飞书 / 安卓等渠道 |
 | ⏰ **定时任务** | Cron 调度，支持持久化、JSONL 运行日志、群聊 / 私聊推送；启动时幂等确保 04:00 每日记忆归档任务 |
 | 🧾 **命令执行** | 白名单 / 黑名单策略 + 审批机制，超时与输出长度限制 |
 | 📁 **文件读写** | 基于 `FilesystemBackend` 的工作区文件系统，支撑记忆与技能存储 |
@@ -66,11 +66,14 @@ pnpm dev
 # DingTalk 机器人模式
 pnpm dingtalk
 
+# iOS WebSocket 模式
+pnpm ios
+
 # 统一服务端（多渠道入口，按 config/CHANNELS 启动）
 pnpm run server
 ```
 
-多渠道启动方式（当前已实现 dingtalk，其他渠道可扩展接入）：
+多渠道启动方式（当前已实现 dingtalk + ios）：
 
 ```bash
 # 启动 config.json 中所有 enabled 渠道
@@ -78,6 +81,8 @@ pnpm run server
 
 # 按环境变量显式指定渠道（逗号分隔）
 CHANNELS=dingtalk pnpm run server
+CHANNELS=ios pnpm run server
+CHANNELS=dingtalk,ios pnpm run server
 
 # 生产建议：先构建再运行统一入口
 pnpm build
@@ -90,6 +95,7 @@ pnpm start:server
 
 - 服务端日志：`logs/server-YYYY-MM-DD.log`
 - 钉钉通道日志：`logs/dingtalk-server-YYYY-MM-DD.log`
+- iOS 通道日志：`logs/ios-server-YYYY-MM-DD.log`
 
 ## 文档导航
 
@@ -106,6 +112,7 @@ pomelobot/
 ├── src/
 │   ├── index.ts                 # CLI 入口
 │   ├── dingtalk.ts              # DingTalk 入口
+│   ├── ios.ts                   # iOS WebSocket 入口
 │   ├── server.ts                # 多渠道统一服务端入口
 │   ├── agent.ts                 # 主代理创建与工具注册
 │   ├── config.ts                # 配置加载与类型定义
@@ -145,13 +152,16 @@ pomelobot/
 │       ├── gateway/
 │       │   ├── service.ts       # GatewayService（注册/分发/去重）
 │       │   └── types.ts         # ChannelAdapter/消息模型
-│       └── dingtalk/
-│           ├── adapter.ts       # DingTalk ChannelAdapter
-│           ├── handler.ts       # 消息处理（文本 / 语音 / 图片 / 文件）
-│           ├── client.ts        # DingTalk Stream 客户端
-│           ├── approvals.ts     # 命令执行审批（文本 / 按钮模式）
-│           ├── context.ts       # 会话上下文管理
-│           └── types.ts
+│       ├── dingtalk/
+│       │   ├── adapter.ts       # DingTalk ChannelAdapter
+│       │   ├── handler.ts       # 消息处理（文本 / 语音 / 图片 / 文件）
+│       │   ├── client.ts        # DingTalk Stream 客户端
+│       │   ├── approvals.ts     # 命令执行审批（文本 / 按钮模式）
+│       │   ├── context.ts       # 会话上下文管理
+│       │   └── types.ts
+│       └── ios/
+│           ├── adapter.ts       # iOS WebSocket ChannelAdapter
+│           └── types.ts         # iOS 消息协议类型
 ├── workspace/
 │   ├── MEMORY.md                # 长期记忆
 │   ├── memory/                  # 每日记忆目录
@@ -339,7 +349,7 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
 > - `transport` 支持 `stdio`、`http`、`sse` 三种模式
-> - MCP 工具会自动注入主 Agent 工具列表，CLI 和 DingTalk 模式均可使用
+> - MCP 工具会自动注入主 Agent 工具列表，CLI / DingTalk / iOS 模式均可使用
 
 ### 定时任务
 
@@ -389,6 +399,32 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
     }
 }
 ```
+
+### iOS WebSocket
+
+```jsonc
+{
+    "ios": {
+        "enabled": false,
+        "host": "0.0.0.0",
+        "port": 18080,
+        "path": "/ws/ios",
+        "authToken": "",                   // 可选：用于 hello 认证
+        "debug": false,
+        "maxPayloadBytes": 1048576,
+        "pingIntervalMs": 30000,
+        "cron": {
+            "defaultTarget": "conversation:ios-default", // 默认推送目标
+            "useMarkdown": false,
+            "title": "iOS 定时任务",
+            "store": "./workspace/cron/ios-jobs.json",
+            "runLog": "./workspace/cron/ios-runs.jsonl"
+        }
+    }
+}
+```
+
+> iOS target 约定：`conversation:<id>` / `user:<id>` / `connection:<id>`，无前缀时按 conversationId 解析。
 
 ## 斜杠命令
 
@@ -487,6 +523,22 @@ pnpm dingtalk
 - ✅ Card.Streaming.Write — 对卡片进行流式更新
 
 > **注意**：钉钉应用机器人需要配置可见人员并发布后才可使用。
+
+## iOS WebSocket 服务
+
+```bash
+pnpm ios
+
+# 或统一入口
+CHANNELS=ios pnpm run server
+```
+
+### 协议要点
+
+- 客户端连接后先发 `hello`（可带 `authToken`）完成会话初始化
+- 用户消息使用 `type=message`，最少包含 `text`，其余字段可由服务端自动补全
+- 服务端回复 `type=reply`，主动推送为 `type=proactive`
+- iOS 定时任务推送目标支持：`conversation:<id>` / `user:<id>` / `connection:<id>`
 
 ## 容器部署
 
