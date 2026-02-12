@@ -7,12 +7,14 @@
     "scripts": {
         "dev": "tsx src/index.ts",
         "dingtalk": "tsx src/dingtalk.ts",
+        "ios": "tsx src/ios.ts",
         "server": "tsx src/server.ts",
         "channels": "tsx src/server.ts",
         "build": "tsc",
         "start": "node dist/index.js",
         "start:server": "node dist/server.js",
         "start:channels": "node dist/server.js",
+        "start:ios": "node dist/ios.js",
         "typecheck": "tsc --noEmit"
     },
     "keywords": [
@@ -34,11 +36,13 @@
         "deepagents": "^1.7.0",
         "dingtalk-stream": "^2.1.4",
         "pg": "^8.18.0",
+        "ws": "^8.19.0",
         "zod": "^3.23.0"
     },
     "devDependencies": {
         "@types/node": "^22.0.0",
         "@types/pg": "^8.16.0",
+        "@types/ws": "^8.18.1",
         "tsx": "^4.19.0",
         "typescript": "^5.5.0"
     }

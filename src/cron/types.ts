@@ -14,6 +14,7 @@ export interface CronPayload {
 }
 
 export interface CronDeliveryConfig {
+    channel?: string;
     target?: string;
     useMarkdown?: boolean;
     title?: string;

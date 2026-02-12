@@ -168,5 +168,22 @@
             "templateId": "",
             "timeoutMs": 300000
         }
+    },
+    "ios": {
+        "enabled": false,
+        "host": "0.0.0.0",
+        "port": 18080,
+        "path": "/ws/ios",
+        "authToken": "",
+        "debug": false,
+        "maxPayloadBytes": 1048576,
+        "pingIntervalMs": 30000,
+        "cron": {
+            "defaultTarget": "conversation:ios-default",
+            "useMarkdown": false,
+            "title": "iOS 定时任务",
+            "store": "./workspace/cron/ios-jobs.json",
+            "runLog": "./workspace/cron/ios-runs.jsonl"
+        }
     }
 }
