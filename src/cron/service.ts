@@ -248,11 +248,17 @@ export class CronService {
             ...this.defaultDelivery,
             ...(input || {}),
         };
+        if (merged.channel) {
+            merged.channel = merged.channel.trim().toLowerCase() || undefined;
+        }
         if (merged.target) {
             merged.target = merged.target.trim() || undefined;
         }
         if (merged.title) {
             merged.title = merged.title.trim() || undefined;
+        }
+        if (!merged.channel) {
+            delete merged.channel;
         }
         if (!merged.target) {
             delete merged.target;

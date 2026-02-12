@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Config } from '../config.js';
 import { getCronService } from './runtime.js';
 import { formatScheduleSummary } from './schedule.js';
-import { getDingTalkConversationContext } from '../channels/dingtalk/context.js';
+import { getChannelConversationContext } from '../channels/context.js';
 import type { CronJob } from './types.js';
 
 function formatDateTime(ms?: number): string {
@@ -20,6 +20,7 @@ function formatJob(job: CronJob): string {
         `  nextRun: ${formatDateTime(job.state.nextRunAtMs)}`,
         `  lastRun: ${formatDateTime(job.state.lastRunAtMs)}`,
         `  lastStatus: ${job.state.lastStatus || 'n/a'}`,
+        `  channel: ${job.delivery.channel || 'n/a'}`,
         `  target: ${job.delivery.target || 'n/a'}`,
         `  message: ${job.payload.message}`,
     ];
@@ -29,16 +30,40 @@ function formatJob(job: CronJob): string {
     return lines.join('\n');
 }
 
-function resolveDefaultTargetFromConversation(): string | undefined {
-    const context = getDingTalkConversationContext();
+function resolveConversationDefaultDelivery(): { channel: string; target: string } | undefined {
+    const context = getChannelConversationContext();
     if (!context) return undefined;
-    return context.isDirect ? context.senderId : context.conversationId;
+
+    if (context.channel !== 'dingtalk' && context.channel !== 'ios') {
+        return undefined;
+    }
+
+    const target = context.isDirect
+        ? context.senderId?.trim()
+        : context.conversationId?.trim();
+
+    if (!target) {
+        return undefined;
+    }
+
+    return {
+        channel: context.channel,
+        target,
+    };
+}
+
+function resolveCurrentChannel(): string | undefined {
+    const context = getChannelConversationContext();
+    if (!context) return undefined;
+    const channel = context.channel?.trim().toLowerCase();
+    if (!channel) return undefined;
+    return channel;
 }
 
 function requireCronService() {
-    const service = getCronService();
+    const service = getCronService(resolveCurrentChannel()) || getCronService();
     if (!service) {
-        throw new Error('Cron 服务未初始化，请在 DingTalk 模式启动后再试。');
+        throw new Error('Cron 服务未初始化，请在渠道服务启动后再试。');
     }
     return service;
 }
@@ -71,9 +96,11 @@ export function createCronTools(_config: Config) {
     );
 
     const cronAddTool = tool(
-        async ({ name, description, message, scheduleKind, at, every, cronExpr, timezone, target, enabled, title, useMarkdown }) => {
+        async ({ name, description, message, scheduleKind, at, every, cronExpr, timezone, channel, target, enabled, title, useMarkdown }) => {
             const service = requireCronService();
-            const resolvedTarget = target?.trim() || resolveDefaultTargetFromConversation();
+            const fallbackDelivery = resolveConversationDefaultDelivery();
+            const resolvedChannel = channel?.trim().toLowerCase() || fallbackDelivery?.channel;
+            const resolvedTarget = target?.trim() || fallbackDelivery?.target;
             const schedule =
                 scheduleKind === 'at'
                     ? { kind: 'at' as const, at: at || '' }
@@ -90,6 +117,7 @@ export function createCronTools(_config: Config) {
                     message,
                 },
                 delivery: {
+                    channel: resolvedChannel,
                     target: resolvedTarget,
                     title,
                     useMarkdown,
@@ -99,7 +127,7 @@ export function createCronTools(_config: Config) {
         },
         {
             name: 'cron_job_add',
-            description: '创建定时任务（支持 at/every/cron），任务运行后会发送结果到 DingTalk 目标。',
+            description: '创建定时任务（支持 at/every/cron），任务运行后会发送结果到目标渠道。',
             schema: z.object({
                 name: z.string().describe('任务名称'),
                 description: z.string().optional().describe('任务描述，可选'),
@@ -109,7 +137,8 @@ export function createCronTools(_config: Config) {
                 every: z.union([z.string(), z.number()]).optional().describe('scheduleKind=every 时使用，例如 30m / 1h / 86400000'),
                 cronExpr: z.string().optional().describe('scheduleKind=cron 时使用，5 段 cron 表达式'),
                 timezone: z.string().optional().describe('时区，例如 Asia/Shanghai'),
-                target: z.string().optional().describe('DingTalk 发送目标；群聊用 openConversationId（通常以 cid 开头），私聊可用 userId'),
+                channel: z.string().optional().describe('发送渠道，可选：dingtalk / ios；默认取当前会话渠道'),
+                target: z.string().optional().describe('发送目标。dingtalk: openConversationId/userId；ios: conversation:<id>/user:<id>/connection:<id>'),
                 enabled: z.boolean().optional().describe('是否启用，默认 true'),
                 title: z.string().optional().describe('推送标题，可选'),
                 useMarkdown: z.boolean().optional().describe('是否使用 markdown 发送，可选'),
@@ -118,7 +147,7 @@ export function createCronTools(_config: Config) {
     );
 
     const cronUpdateTool = tool(
-        async ({ id, name, description, message, scheduleKind, at, every, cronExpr, timezone, target, enabled, title, useMarkdown }) => {
+        async ({ id, name, description, message, scheduleKind, at, every, cronExpr, timezone, channel, target, enabled, title, useMarkdown }) => {
             const service = requireCronService();
             const patch: {
                 name?: string;
@@ -126,7 +155,7 @@ export function createCronTools(_config: Config) {
                 enabled?: boolean;
                 schedule?: { kind: 'at'; at: string } | { kind: 'every'; every: string | number } | { kind: 'cron'; expr: string; timezone?: string };
                 payload?: { message?: string };
-                delivery?: { target?: string; title?: string; useMarkdown?: boolean };
+                delivery?: { channel?: string; target?: string; title?: string; useMarkdown?: boolean };
             } = {};
 
             if (name !== undefined) patch.name = name;
@@ -142,8 +171,9 @@ export function createCronTools(_config: Config) {
                 patch.schedule = { kind: 'cron', expr: cronExpr || '', timezone };
             }
 
-            if (target !== undefined || title !== undefined || useMarkdown !== undefined) {
+            if (channel !== undefined || target !== undefined || title !== undefined || useMarkdown !== undefined) {
                 patch.delivery = {
+                    channel: channel?.trim() || undefined,
                     target: target?.trim() || undefined,
                     title,
                     useMarkdown,
@@ -166,7 +196,8 @@ export function createCronTools(_config: Config) {
                 every: z.union([z.string(), z.number()]).optional().describe('scheduleKind=every 时使用'),
                 cronExpr: z.string().optional().describe('scheduleKind=cron 时使用'),
                 timezone: z.string().optional().describe('cron 时区'),
-                target: z.string().optional().describe('新的 DingTalk 发送目标'),
+                channel: z.string().optional().describe('发送渠道：dingtalk / ios'),
+                target: z.string().optional().describe('新的发送目标'),
                 enabled: z.boolean().optional().describe('是否启用'),
                 title: z.string().optional().describe('推送标题'),
                 useMarkdown: z.boolean().optional().describe('是否 markdown'),

@@ -156,6 +156,7 @@ export type MCPOutputHandling =
     };
 
 export interface MCPServerBaseConfig {
+    env?: Record<string, string>;
     defaultToolTimeout?: number;
     outputHandling?: MCPOutputHandling;
 }
@@ -164,7 +165,6 @@ export interface MCPServerStdioConfig extends MCPServerBaseConfig {
     transport: 'stdio';
     command: string;
     args?: string[];
-    env?: Record<string, string>;
     cwd?: string;
     stderr?: 'overlapped' | 'pipe' | 'ignore' | 'inherit';
     restart?: {
@@ -228,6 +228,24 @@ export interface DingTalkConfig {
     };
 }
 
+export interface IOSConfig {
+    enabled: boolean;
+    host: string;
+    port: number;
+    path: string;
+    authToken?: string;
+    debug?: boolean;
+    maxPayloadBytes?: number;
+    pingIntervalMs?: number;
+    cron?: {
+        defaultTarget?: string;
+        useMarkdown?: boolean;
+        title?: string;
+        store?: string;
+        runLog?: string;
+    };
+}
+
 export interface CronConfig {
     enabled: boolean;
     store: string;
@@ -242,6 +260,7 @@ export interface Config {
     mcp: MCPConfig;
     cron: CronConfig;
     dingtalk?: DingTalkConfig;
+    ios?: IOSConfig;
 }
 
 const DEFAULT_COMMANDS: ExecCommandsFile = {
@@ -365,6 +384,15 @@ const DEFAULT_CONFIG = {
         timezone: DEFAULT_TIMEZONE,
         runLog: './workspace/cron/runs.jsonl',
     },
+    ios: {
+        enabled: false,
+        host: '0.0.0.0',
+        port: 18080,
+        path: '/ws/ios',
+        debug: false,
+        maxPayloadBytes: 1024 * 1024,
+        pingIntervalMs: 30000,
+    },
 };
 
 /**
@@ -399,6 +427,40 @@ function loadExecCommands(execConfig: ExecConfigFile): ExecCommandsFile {
 export function loadConfig(): Config {
     const configPath = join(process.cwd(), 'config.json');
 
+    const normalizeIOSConfig = (input?: Partial<IOSConfig>): IOSConfig | undefined => {
+        if (!input) return undefined;
+
+        const rawPort = Number(input.port);
+        const rawMaxPayload = Number(input.maxPayloadBytes);
+        const rawPingInterval = Number(input.pingIntervalMs);
+
+        return {
+            enabled: input.enabled ?? DEFAULT_CONFIG.ios.enabled,
+            host: input.host?.trim() || DEFAULT_CONFIG.ios.host,
+            port: Number.isFinite(rawPort) && rawPort > 0
+                ? Math.floor(rawPort)
+                : DEFAULT_CONFIG.ios.port,
+            path: input.path?.trim() || DEFAULT_CONFIG.ios.path,
+            authToken: input.authToken?.trim() || undefined,
+            debug: input.debug ?? DEFAULT_CONFIG.ios.debug,
+            maxPayloadBytes: Number.isFinite(rawMaxPayload) && rawMaxPayload > 0
+                ? Math.floor(rawMaxPayload)
+                : DEFAULT_CONFIG.ios.maxPayloadBytes,
+            pingIntervalMs: Number.isFinite(rawPingInterval) && rawPingInterval >= 0
+                ? Math.floor(rawPingInterval)
+                : DEFAULT_CONFIG.ios.pingIntervalMs,
+            cron: input.cron
+                ? {
+                    defaultTarget: input.cron.defaultTarget?.trim() || undefined,
+                    useMarkdown: input.cron.useMarkdown,
+                    title: input.cron.title?.trim() || undefined,
+                    store: input.cron.store?.trim() || undefined,
+                    runLog: input.cron.runLog?.trim() || undefined,
+                }
+                : undefined,
+        };
+    };
+
     let fileConfig: {
         llm?: {
             default_model?: string;
@@ -424,6 +486,7 @@ export function loadConfig(): Config {
         mcp?: Partial<MCPConfig>;
         cron?: Partial<CronConfig>;
         dingtalk?: DingTalkConfig;
+        ios?: Partial<IOSConfig>;
     } = {};
 
     if (existsSync(configPath)) {
@@ -559,6 +622,7 @@ export function loadConfig(): Config {
             timezone: fileConfig.cron?.timezone || DEFAULT_CONFIG.cron.timezone,
         },
         dingtalk: fileConfig.dingtalk,
+        ios: normalizeIOSConfig(fileConfig.ios),
     };
 
     const pushModel = (list: LLMModelConfig[], model: LLMModelConfig): void => {
