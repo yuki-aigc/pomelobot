@@ -7,19 +7,14 @@
  * Usage: pnpm dingtalk
  */
 
-import { DWClient, TOPIC_CARD, TOPIC_ROBOT } from 'dingtalk-stream';
+import { DWClient } from 'dingtalk-stream';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { createAgent } from './agent.js';
 import type { ExecApprovalRequest } from './agent.js';
 import { loadConfig } from './config.js';
-import {
-    getActiveModelAlias,
-    getActiveModelName,
-    hasModelAlias,
-    setActiveModelAlias,
-} from './llm.js';
+import { getActiveModelName } from './llm.js';
+import { ConversationRuntime } from './conversation/runtime.js';
 import {
     handleMessage,
     flushSessionsOnShutdown,
@@ -29,15 +24,13 @@ import {
 } from './channels/dingtalk/index.js';
 import { sendProactiveMessage } from './channels/dingtalk/client.js';
 import { createDingTalkChannelAdapter } from './channels/dingtalk/adapter.js';
-import { requestDingTalkExecApproval, withApprovalContext, tryHandleExecApprovalCardCallback } from './channels/dingtalk/approvals.js';
+import { requestDingTalkExecApproval, withApprovalContext } from './channels/dingtalk/approvals.js';
 import { GatewayService } from './channels/gateway/index.js';
-import type { ChannelInboundMessage } from './channels/gateway/index.js';
 import { CronService } from './cron/service.js';
 import { setCronService } from './cron/runtime.js';
 import { resolveCronStorePath } from './cron/store.js';
 import type { CronJob } from './cron/types.js';
 import type { RuntimeLogWriter } from './log/runtime.js';
-import { buildPromptBootstrapMessage } from './prompt/bootstrap.js';
 
 // ANSI terminal colors
 const colors = {
@@ -53,8 +46,6 @@ const colors = {
     cyan: '\x1b[36m',
 };
 
-// Cache discovered group conversation IDs to avoid noisy duplicate logs.
-const seenGroupConversations = new Map<string, string>();
 const AUTO_MEMORY_SAVE_JOB_NAME = '系统任务：每日记忆归档(04:00)';
 const AUTO_MEMORY_SAVE_JOB_MARKER = '[system:auto-memory-save-4am:v1]';
 const AUTO_MEMORY_SAVE_JOB_CRON_EXPR = '0 4 * * *';
@@ -303,37 +294,6 @@ function buildCronDeliveryTarget(job: CronJob, config: ReturnType<typeof loadCon
     return undefined;
 }
 
-function buildGatewayInboundFromDingTalk(params: {
-    data: DingTalkInboundMessage;
-    messageIdFromHeader?: string;
-}): ChannelInboundMessage {
-    const { data, messageIdFromHeader } = params;
-    const senderId = data.senderStaffId || data.senderId;
-    const senderName = data.senderNick || 'Unknown';
-    const isDirect = data.conversationType === '1';
-    const messageId = data.msgId || messageIdFromHeader || `dingtalk-${Date.now()}`;
-    const fallbackText = data.text?.content?.trim() || '';
-    const text = fallbackText
-        || data.content?.recognition?.trim()
-        || (data.msgtype ? `[${data.msgtype}]` : '[消息]');
-
-    return {
-        channel: 'dingtalk',
-        messageId,
-        idempotencyKey: data.msgId || messageIdFromHeader || messageId,
-        timestamp: data.createAt || Date.now(),
-        conversationId: data.conversationId,
-        conversationTitle: data.conversationTitle,
-        isDirect,
-        senderId,
-        senderName,
-        sessionWebhook: data.sessionWebhook,
-        text,
-        messageType: data.msgtype || 'text',
-        raw: data,
-    };
-}
-
 export async function startDingTalkService(options?: {
     registerSignalHandlers?: boolean;
     exitOnShutdown?: boolean;
@@ -342,7 +302,6 @@ export async function startDingTalkService(options?: {
     const registerSignalHandlers = options?.registerSignalHandlers ?? false;
     const exitOnShutdown = options?.exitOnShutdown ?? false;
     const config = loadConfig();
-    let cleanup: (() => Promise<void>) | null = null;
     let cronService: CronService | null = null;
     let gateway: GatewayService | null = null;
 
@@ -371,12 +330,13 @@ export async function startDingTalkService(options?: {
     log.info('[DingTalk] Initializing agent...');
     const execApprovalPrompt = async (request: ExecApprovalRequest) =>
         requestDingTalkExecApproval(request);
-    const initialAgentContext = await createAgent(config, {
-        execApprovalPrompt,
+    const conversationRuntime = new ConversationRuntime({
+        config,
         runtimeChannel: 'dingtalk',
+        execApprovalPrompt,
     });
-    cleanup = initialAgentContext.cleanup;
-    let currentAgent = initialAgentContext.agent;
+    await conversationRuntime.initialize();
+    let currentAgent = conversationRuntime.getAgent();
     log.info('[DingTalk] Agent initialized successfully');
 
     // Create DingTalk Stream client
@@ -396,63 +356,10 @@ export async function startDingTalkService(options?: {
         dingtalkConfig,
         log,
         switchModel: async (alias: string) => {
-            const trimmedAlias = alias.trim();
-            if (!trimmedAlias) {
-                throw new Error('模型别名不能为空');
-            }
-            if (!hasModelAlias(config, trimmedAlias)) {
-                throw new Error(`未找到模型别名: ${trimmedAlias}`);
-            }
-
-            const previousAlias = getActiveModelAlias(config);
-            if (previousAlias === trimmedAlias) {
-                return {
-                    alias: trimmedAlias,
-                    model: getActiveModelName(config),
-                };
-            }
-
-            let nextCleanup: (() => Promise<void>) | null = null;
-            try {
-                setActiveModelAlias(config, trimmedAlias);
-                const nextAgentContext = await createAgent(config, {
-                    execApprovalPrompt,
-                    runtimeChannel: 'dingtalk',
-                });
-                nextCleanup = nextAgentContext.cleanup;
-
-                const oldCleanup = cleanup;
-                currentAgent = nextAgentContext.agent;
-                ctx.agent = nextAgentContext.agent;
-                cleanup = nextAgentContext.cleanup;
-
-                if (oldCleanup) {
-                    try {
-                        await oldCleanup();
-                    } catch (error) {
-                        log.warn('[DingTalk] previous agent cleanup failed:', error instanceof Error ? error.message : String(error));
-                    }
-                }
-
-                return {
-                    alias: trimmedAlias,
-                    model: getActiveModelName(config),
-                };
-            } catch (error) {
-                if (nextCleanup) {
-                    try {
-                        await nextCleanup();
-                    } catch {
-                        // ignore cleanup errors when switch fails
-                    }
-                }
-                try {
-                    setActiveModelAlias(config, previousAlias);
-                } catch {
-                    // ignore rollback errors and bubble up original error
-                }
-                throw error;
-            }
+            const result = await conversationRuntime.switchModel(alias);
+            currentAgent = conversationRuntime.getAgent();
+            ctx.agent = currentAgent;
+            return result;
         },
     };
 
@@ -491,14 +398,11 @@ export async function startDingTalkService(options?: {
             }
 
             const threadId = `cron-${job.id}-${Date.now()}-${randomUUID().slice(0, 8)}`;
-            const cronMessages: Array<{ role: 'user'; content: string }> = [];
-            const bootstrapPromptMessage = await buildPromptBootstrapMessage({
+            const cronMessages = await conversationRuntime.buildBootstrapMessages({
+                threadId,
                 workspacePath: memoryWorkspacePath,
                 scopeKey: 'main',
             });
-            if (bootstrapPromptMessage) {
-                cronMessages.push(bootstrapPromptMessage);
-            }
             cronMessages.push({
                 role: 'user',
                 content: `[定时任务 ${job.name}] ${job.payload.message}`,
@@ -582,69 +486,13 @@ export async function startDingTalkService(options?: {
             error: (message: string, ...args: unknown[]) => log.error(message, ...args),
         },
     });
-    const dingtalkAdapter = createDingTalkChannelAdapter({ config: dingtalkConfig, log });
+    const dingtalkAdapter = createDingTalkChannelAdapter({
+        config: dingtalkConfig,
+        log,
+        client,
+    });
     gateway.registerAdapter(dingtalkAdapter);
     await gateway.start();
-
-    // Register message callback
-    client.registerCallbackListener(TOPIC_ROBOT, async (res: { headers?: { messageId?: string }; data: string }) => {
-        const messageId = res.headers?.messageId;
-
-        try {
-            // Acknowledge message receipt immediately
-            if (messageId) {
-                client.socketCallBackResponse(messageId, { success: true });
-            }
-
-            // Parse and handle message
-            const data = JSON.parse(res.data) as DingTalkInboundMessage;
-            const isDirect = data.conversationType === '1';
-            const senderId = data.senderStaffId || data.senderId;
-            const senderName = data.senderNick || 'Unknown';
-            if (!isDirect) {
-                const conversationId = data.conversationId || '';
-                const conversationTitle = (data.conversationTitle || '').trim() || '(未命名群)';
-                const previousTitle = seenGroupConversations.get(conversationId);
-                if (!previousTitle || previousTitle !== conversationTitle) {
-                    seenGroupConversations.set(conversationId, conversationTitle);
-                    log.info(`[DingTalk] 群会话映射: ${conversationTitle} -> ${conversationId}`);
-                }
-            }
-            const dispatchResult = await dingtalkAdapter.handleInbound(
-                buildGatewayInboundFromDingTalk({
-                    data,
-                    messageIdFromHeader: messageId,
-                })
-            );
-            if (dispatchResult.status === 'error') {
-                log.error(`[DingTalk] Gateway dispatch failed: ${dispatchResult.reason || '(unknown)'}`);
-            } else if (dispatchResult.status === 'duplicate') {
-                log.debug('[DingTalk] Duplicate inbound message skipped by gateway');
-            }
-
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            log.error(`[DingTalk] Error processing message: ${errorMessage}`);
-        }
-    });
-
-    // Card interaction callback (button approvals)
-    client.registerCallbackListener(TOPIC_CARD, async (res: { headers?: { messageId?: string }; data: string }) => {
-        const messageId = res.headers?.messageId;
-
-        try {
-            if (messageId) {
-                client.socketCallBackResponse(messageId, { success: true });
-            }
-
-            const payload = JSON.parse(res.data) as Record<string, unknown>;
-            log.debug?.(`[DingTalk] Card callback payload: ${JSON.stringify(payload)}`);
-            await tryHandleExecApprovalCardCallback({ payload, log });
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            log.error(`[DingTalk] Error processing card callback: ${errorMessage}`);
-        }
-    });
 
     // Connect to DingTalk
     await client.connect();
@@ -706,12 +554,10 @@ export async function startDingTalkService(options?: {
             log.warn('[DingTalk] session resource cleanup failed:', error instanceof Error ? error.message : String(error));
         }
 
-        if (cleanup) {
-            try {
-                await cleanup();
-            } catch (error) {
-                log.warn('[DingTalk] MCP cleanup failed:', error instanceof Error ? error.message : String(error));
-            }
+        try {
+            await conversationRuntime.close();
+        } catch (error) {
+            log.warn('[DingTalk] MCP cleanup failed:', error instanceof Error ? error.message : String(error));
         }
 
         console.log(`${colors.gray}Goodbye! 👋${colors.reset}`);

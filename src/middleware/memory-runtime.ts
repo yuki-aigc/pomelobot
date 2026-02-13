@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { appendFile, readdir, readFile, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, join, relative, resolve } from 'node:path';
 import { Pool, type PoolConfig } from 'pg';
 import type {
@@ -10,6 +10,9 @@ import type {
     Config,
 } from '../config.js';
 import type { MemoryScope } from './memory-scope.js';
+import { MemoryIndexerLayer } from './memory-runtime/indexer-layer.js';
+import { MemoryRetrieverLayer } from './memory-runtime/retriever-layer.js';
+import { MemoryStoreLayer } from './memory-runtime/store-layer.js';
 
 const MAX_SNIPPET_CHARS = 220;
 const DEFAULT_CHUNK_CHARS = 1200;
@@ -176,17 +179,6 @@ function quoteIdentifier(input: string): string {
         throw new Error(`Invalid SQL identifier: ${input}`);
     }
     return `"${input}"`;
-}
-
-function formatLocalDate(date: Date): string {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-}
-
-function formatTimeStamp(date: Date): string {
-    return date.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
 function sha256(value: string): string {
@@ -447,6 +439,9 @@ export class MemoryRuntime {
     private readonly embeddingCacheTable: string;
     private readonly sessionEventsTable: string;
     private readonly embeddingProviders: AgentMemoryEmbeddingProviderConfig[];
+    private readonly indexerLayer: MemoryIndexerLayer;
+    private readonly retrieverLayer: MemoryRetrieverLayer;
+    private readonly storeLayer: MemoryStoreLayer;
 
     private pool: Pool | null = null;
     private pgReady = false;
@@ -477,6 +472,73 @@ export class MemoryRuntime {
         this.embeddingCacheTable = `${this.schemaSql}.embedding_cache`;
         this.sessionEventsTable = `${this.schemaSql}.dingtalk_session_events`;
         this.embeddingProviders = resolveEmbeddingProviders(config);
+        this.indexerLayer = new MemoryIndexerLayer({
+            memoryConfig: this.memoryConfig,
+            workspacePath: this.workspacePath,
+            canUsePg: () => this.canUsePg(),
+            buildPgPoolConfig: () => buildPgPoolConfig(this.memoryConfig),
+            getPool: () => this.pool,
+            setPool: (pool) => {
+                this.pool = pool;
+            },
+            ensurePgSchema: () => this.ensurePgSchema(),
+            startBackgroundWorkers: () => this.startBackgroundWorkers(),
+            stopBackgroundWorkers: () => this.stopBackgroundWorkers(),
+            getSessionEventEmbeddingBackfillInFlight: () => this.sessionEventEmbeddingBackfillInFlight,
+            getSessionEventTtlCleanupInFlight: () => this.sessionEventTtlCleanupInFlight,
+            getSyncDebounceTimer: () => this.syncDebounceTimer,
+            setSyncDebounceTimer: (timer) => {
+                this.syncDebounceTimer = timer;
+            },
+            setPgReady: (value) => {
+                this.pgReady = value;
+            },
+            setVectorAvailable: (value) => {
+                this.vectorAvailable = value;
+            },
+            setSessionEventsAvailable: (value) => {
+                this.sessionEventsAvailable = value;
+            },
+            setSessionEventVectorAvailable: (value) => {
+                this.sessionEventVectorAvailable = value;
+            },
+            getSyncInFlight: () => this.syncInFlight,
+            setSyncInFlight: (value) => {
+                this.syncInFlight = value;
+            },
+            runIncrementalSync: (options) => this.runIncrementalSync(options),
+            pendingSyncPaths: this.pendingSyncPaths,
+            syncIncrementalRef: (options) => this.syncIncremental(options),
+            transcriptSyncDebounceMs: TRANSCRIPT_SYNC_DEBOUNCE_MS,
+        });
+        this.retrieverLayer = new MemoryRetrieverLayer({
+            memoryConfig: this.memoryConfig,
+            canUsePg: () => this.canUsePg(),
+            maybeSyncBeforeSearch: () => this.maybeSyncBeforeSearch(),
+            searchFromFiles: (query, scope) => this.searchFromFiles(query, scope),
+            searchPgKeywordUnified: (query, scopeKey, limit) => this.searchPgKeywordUnified(query, scopeKey, limit),
+            searchPgFtsUnified: (query, scopeKey, limit) => this.searchPgFtsUnified(query, scopeKey, limit),
+            searchPgVector: (query, scopeKey, limit) => this.searchPgVector(query, scopeKey, limit),
+            searchPgSessionEventsFts: (query, scopeKey, limit) => this.searchPgSessionEventsFts(query, scopeKey, limit),
+            searchPgSessionEventsVector: (query, scopeKey, limit) => this.searchPgSessionEventsVector(query, scopeKey, limit),
+            searchPgSessionEventsTemporal: (query, scopeKey, limit) => this.searchPgSessionEventsTemporal(query, scopeKey, limit),
+            mergeRows: (rows, limit) => this.mergeRows(rows, limit),
+            rowToHit: (row, strategy) => this.rowToHit(row, strategy),
+            mergeHybrid: (vectorRows, ftsRows, vectorWeight, ftsWeight) =>
+                mergeHybrid(vectorRows, ftsRows, vectorWeight, ftsWeight),
+            readSessionEvent: (path, range, scope) => this.readSessionEvent(path, range, scope),
+            readMemoryFile: (path, range, scope) => this.readMemoryFile(path, range, scope),
+            maxMemoryGetLines: MAX_MEMORY_GET_LINES,
+            maxMemoryGetChars: MAX_MEMORY_GET_CHARS,
+            defaultMemoryGetLines: DEFAULT_MEMORY_GET_LINES,
+        });
+        this.storeLayer = new MemoryStoreLayer({
+            workspacePath: this.workspacePath,
+            memoryConfig: this.memoryConfig,
+            canUsePg: () => this.canUsePg(),
+            syncIncremental: (options) => this.syncIncremental(options),
+            schedulePathSync: (paths) => this.schedulePathSync(paths),
+        });
     }
 
     static async create(workspacePath: string, config: Config): Promise<MemoryRuntime> {
@@ -486,32 +548,7 @@ export class MemoryRuntime {
     }
 
     private async initialize(): Promise<void> {
-        if (this.memoryConfig.backend !== 'pgsql' && !this.memoryConfig.pgsql.enabled) {
-            return;
-        }
-
-        const poolConfig = buildPgPoolConfig(this.memoryConfig);
-        if (!poolConfig) {
-            console.warn('[Memory] PGSQL backend requested but connection config is incomplete, fallback to filesystem');
-            return;
-        }
-
-        try {
-            this.pool = new Pool(poolConfig);
-            await this.pool.query('SELECT 1');
-            await this.ensurePgSchema();
-            this.pgReady = true;
-            await this.syncIncremental({ force: true });
-            this.startBackgroundWorkers();
-        } catch (error) {
-            console.warn('[Memory] PGSQL initialization failed, fallback to filesystem:', error instanceof Error ? error.message : String(error));
-            await this.pool?.end().catch(() => undefined);
-            this.pool = null;
-            this.pgReady = false;
-            this.vectorAvailable = false;
-            this.sessionEventsAvailable = false;
-            this.sessionEventVectorAvailable = false;
-        }
+        await this.indexerLayer.initialize();
     }
 
     canUsePg(): boolean {
@@ -519,22 +556,7 @@ export class MemoryRuntime {
     }
 
     async close(): Promise<void> {
-        this.stopBackgroundWorkers();
-        await this.sessionEventEmbeddingBackfillInFlight?.catch(() => undefined);
-        await this.sessionEventTtlCleanupInFlight?.catch(() => undefined);
-        if (this.syncDebounceTimer) {
-            clearTimeout(this.syncDebounceTimer);
-            this.syncDebounceTimer = null;
-        }
-        await this.flushPendingSync();
-        if (this.pool) {
-            await this.pool.end().catch(() => undefined);
-            this.pool = null;
-        }
-        this.pgReady = false;
-        this.vectorAvailable = false;
-        this.sessionEventsAvailable = false;
-        this.sessionEventVectorAvailable = false;
+        await this.indexerLayer.close();
     }
 
     private startBackgroundWorkers(): void {
@@ -750,62 +772,15 @@ export class MemoryRuntime {
     }
 
     async syncIncremental(options?: { force?: boolean; onlyPaths?: string[] }): Promise<void> {
-        if (!this.canUsePg()) {
-            return;
-        }
-
-        if (this.syncInFlight) {
-            return this.syncInFlight;
-        }
-
-        this.syncInFlight = this.runIncrementalSync(options)
-            .finally(() => {
-                this.syncInFlight = null;
-            });
-        return this.syncInFlight;
+        return this.indexerLayer.syncIncremental(options);
     }
 
     private schedulePathSync(paths: string[]): void {
-        if (!this.canUsePg()) {
-            return;
-        }
-
-        for (const item of paths) {
-            const abs = resolve(item);
-            if (abs.startsWith(this.workspacePath)) {
-                this.pendingSyncPaths.add(abs);
-            }
-        }
-
-        if (this.pendingSyncPaths.size === 0) {
-            return;
-        }
-
-        if (this.syncDebounceTimer) {
-            clearTimeout(this.syncDebounceTimer);
-        }
-
-        this.syncDebounceTimer = setTimeout(() => {
-            this.syncDebounceTimer = null;
-            void this.flushPendingSync();
-        }, TRANSCRIPT_SYNC_DEBOUNCE_MS);
+        this.indexerLayer.schedulePathSync(paths);
     }
 
     private async flushPendingSync(): Promise<void> {
-        if (!this.canUsePg()) {
-            this.pendingSyncPaths.clear();
-            return;
-        }
-        if (this.pendingSyncPaths.size === 0) {
-            return;
-        }
-
-        const paths = Array.from(this.pendingSyncPaths);
-        this.pendingSyncPaths.clear();
-        await this.syncIncremental({ onlyPaths: paths, force: true })
-            .catch((error) => {
-                console.warn('[Memory] deferred incremental sync failed:', error instanceof Error ? error.message : String(error));
-            });
+        await this.indexerLayer.flushPendingSync();
     }
 
     private shouldRunSessionEventEmbeddingBackfill(): boolean {
@@ -1411,293 +1386,11 @@ export class MemoryRuntime {
     }
 
     async search(query: string, scope: MemoryScope): Promise<MemorySearchHit[]> {
-        const startedAt = Date.now();
-        const mode = this.memoryConfig.retrieval.mode;
-        const queryForLog = query.replace(/\s+/g, ' ').trim().slice(0, 160);
-        const finish = (
-            hits: MemorySearchHit[],
-            path: string,
-            candidates: Record<string, number> = {},
-            extra: Record<string, string | number | boolean> = {},
-        ) => {
-            this.logSearchTrace({
-                scopeKey: scope.key,
-                mode,
-                query: queryForLog,
-                path,
-                candidates,
-                hits,
-                durationMs: Date.now() - startedAt,
-                extra,
-            });
-            return hits;
-        };
-        const fileKeywordFallback = async () => await this.searchFromFiles(query, scope);
-
-        if (this.memoryConfig.backend !== 'pgsql' || !this.canUsePg()) {
-            const hits = await fileKeywordFallback();
-            return finish(hits, 'filesystem_keyword_fallback', { fileHits: hits.length });
-        }
-
-        await this.maybeSyncBeforeSearch();
-
-        const maxResults = this.memoryConfig.retrieval.max_results;
-        const minScore = this.memoryConfig.retrieval.min_score;
-        const keywordFallback = async (fallbackFrom: string) => {
-            const rows = await this.searchPgKeywordUnified(query, scope.key, maxResults);
-            if (rows.length > 0) {
-                const hits = rows
-                    .map((row) => this.rowToHit(row, 'keyword'))
-                    .filter((item) => item.score >= minScore)
-                    .slice(0, maxResults);
-                return finish(hits, `${fallbackFrom}_keyword`, {
-                    keywordRows: rows.length,
-                    keywordHits: hits.length,
-                });
-            }
-            const fileHits = await fileKeywordFallback();
-            return finish(fileHits, `${fallbackFrom}_file_keyword`, {
-                keywordRows: rows.length,
-                fileHits: fileHits.length,
-            });
-        };
-
-        if (mode === 'keyword') {
-            return keywordFallback('mode_keyword');
-        }
-
-        if (mode === 'fts') {
-            const rows = await this.searchPgFtsUnified(query, scope.key, maxResults);
-            if (rows.length === 0) {
-                return keywordFallback('mode_fts_empty');
-            }
-            const hits = rows
-                .map((row) => this.rowToHit(row, 'fts'))
-                .filter((item) => normalizeRankScore(item.score) >= minScore)
-                .map((item) => ({ ...item, score: normalizeRankScore(item.score) }))
-                .sort((a, b) => b.score - a.score)
-                .slice(0, maxResults);
-            return finish(hits, 'mode_fts', {
-                ftsRows: rows.length,
-                ftsHits: hits.length,
-            });
-        }
-
-        if (mode === 'vector') {
-            const candidates = Math.max(
-                maxResults,
-                Math.floor(maxResults * this.memoryConfig.retrieval.hybrid_candidate_multiplier),
-            );
-            const [vectorRows, sessionRows, sessionVectorRows, temporalRows] = await Promise.all([
-                this.searchPgVector(query, scope.key, candidates),
-                this.searchPgSessionEventsFts(query, scope.key, candidates),
-                this.searchPgSessionEventsVector(query, scope.key, candidates),
-                this.searchPgSessionEventsTemporal(query, scope.key, candidates),
-            ]);
-            const mergedVectorRows = this.mergeRows([...vectorRows, ...sessionVectorRows], candidates);
-            const mergedSessionRows = this.mergeRows([...sessionRows, ...temporalRows], candidates);
-
-            if (mergedVectorRows.length === 0) {
-                const ftsRows = await this.searchPgFtsUnified(query, scope.key, maxResults);
-                if (ftsRows.length === 0) {
-                    return keywordFallback('mode_vector_empty');
-                }
-                const hits = ftsRows
-                    .map((row) => this.rowToHit(row, 'fts'))
-                    .map((item) => ({ ...item, score: normalizeRankScore(item.score) }))
-                    .filter((item) => item.score >= minScore)
-                    .sort((a, b) => b.score - a.score)
-                    .slice(0, maxResults);
-                return finish(hits, 'mode_vector_fallback_fts', {
-                    vectorRows: vectorRows.length,
-                    sessionVectorRows: sessionVectorRows.length,
-                    mergedVectorRows: mergedVectorRows.length,
-                    sessionFtsRows: sessionRows.length,
-                    temporalRows: temporalRows.length,
-                    ftsRows: ftsRows.length,
-                    hits: hits.length,
-                });
-            }
-
-            if (mergedSessionRows.length > 0) {
-                const merged = mergeHybrid(
-                    mergedVectorRows,
-                    mergedSessionRows,
-                    this.memoryConfig.retrieval.hybrid_vector_weight,
-                    this.memoryConfig.retrieval.hybrid_fts_weight,
-                ).map((item) => ({ ...item, strategy: 'vector' as const }));
-                const hits = merged
-                    .filter((item) => item.score >= minScore)
-                    .slice(0, maxResults);
-                return finish(hits, 'mode_vector_with_session_merge', {
-                    vectorRows: vectorRows.length,
-                    sessionVectorRows: sessionVectorRows.length,
-                    mergedVectorRows: mergedVectorRows.length,
-                    sessionFtsRows: sessionRows.length,
-                    temporalRows: temporalRows.length,
-                    mergedSessionRows: mergedSessionRows.length,
-                    hits: hits.length,
-                });
-            }
-
-            const hits = mergedVectorRows
-                .map((row) => this.rowToHit(row, 'vector'))
-                .filter((item) => item.score >= minScore)
-                .slice(0, maxResults);
-            return finish(hits, 'mode_vector_only', {
-                vectorRows: vectorRows.length,
-                sessionVectorRows: sessionVectorRows.length,
-                mergedVectorRows: mergedVectorRows.length,
-                sessionFtsRows: sessionRows.length,
-                temporalRows: temporalRows.length,
-                hits: hits.length,
-            });
-        }
-
-        const candidates = Math.max(
-            maxResults,
-            Math.floor(maxResults * this.memoryConfig.retrieval.hybrid_candidate_multiplier),
-        );
-        const [ftsRows, vectorRows, sessionVectorRows] = await Promise.all([
-            this.searchPgFtsUnified(query, scope.key, candidates),
-            this.searchPgVector(query, scope.key, candidates),
-            this.searchPgSessionEventsVector(query, scope.key, candidates),
-        ]);
-        const mergedVectorRows = this.mergeRows([...vectorRows, ...sessionVectorRows], candidates);
-
-        if (mergedVectorRows.length === 0 && ftsRows.length === 0) {
-            return keywordFallback('mode_hybrid_empty');
-        }
-
-        const merged = mergeHybrid(
-            mergedVectorRows,
-            ftsRows,
-            this.memoryConfig.retrieval.hybrid_vector_weight,
-            this.memoryConfig.retrieval.hybrid_fts_weight,
-        );
-
-        const hits = merged
-            .filter((item) => item.score >= minScore)
-            .slice(0, maxResults);
-        return finish(hits, 'mode_hybrid', {
-            ftsRows: ftsRows.length,
-            vectorRows: vectorRows.length,
-            sessionVectorRows: sessionVectorRows.length,
-            mergedVectorRows: mergedVectorRows.length,
-            hits: hits.length,
-        });
-    }
-
-    private logSearchTrace(params: {
-        scopeKey: string;
-        mode: AgentMemoryRetrievalMode;
-        query: string;
-        path: string;
-        candidates: Record<string, number>;
-        hits: MemorySearchHit[];
-        durationMs: number;
-        extra?: Record<string, string | number | boolean>;
-    }): void {
-        const sourceCounts: Record<string, number> = {};
-        const strategyCounts: Record<string, number> = {};
-        for (const hit of params.hits) {
-            sourceCounts[hit.source] = (sourceCounts[hit.source] ?? 0) + 1;
-            strategyCounts[hit.strategy] = (strategyCounts[hit.strategy] ?? 0) + 1;
-        }
-
-        const top = params.hits
-            .slice(0, 3)
-            .map((hit) => `${this.trimLogValue(hit.path, 56)}@${hit.score.toFixed(3)}`)
-            .join('|') || 'none';
-
-        const candidateSummary = this.summarizeCountMap(params.candidates);
-        const sourceSummary = this.summarizeCountMap(sourceCounts);
-        const strategySummary = this.summarizeCountMap(strategyCounts);
-        const extraSummary = params.extra ? this.summarizeExtraMap(params.extra) : 'none';
-
-        console.info(
-            `[Memory][Search] scope=${params.scopeKey} mode=${params.mode} path=${params.path} query="${this.trimLogValue(params.query, 80)}" durationMs=${params.durationMs} candidates={${candidateSummary}} hits=${params.hits.length} bySource={${sourceSummary}} byStrategy={${strategySummary}} extra={${extraSummary}} top={${top}}`
-        );
-    }
-
-    private summarizeCountMap(values: Record<string, number>): string {
-        const entries = Object.entries(values)
-            .filter(([, value]) => Number.isFinite(value) && value >= 0)
-            .sort((a, b) => b[1] - a[1]);
-        if (entries.length === 0) {
-            return 'none';
-        }
-        return entries.map(([key, value]) => `${key}:${value}`).join(',');
-    }
-
-    private summarizeExtraMap(values: Record<string, string | number | boolean>): string {
-        const entries = Object.entries(values);
-        if (entries.length === 0) {
-            return 'none';
-        }
-        return entries.map(([key, value]) => `${key}:${String(value)}`).join(',');
-    }
-
-    private trimLogValue(value: string, maxChars: number): string {
-        const normalized = value.replace(/\s+/g, ' ').trim();
-        if (normalized.length <= maxChars) {
-            return normalized;
-        }
-        return `${normalized.slice(0, Math.max(0, maxChars - 1))}…`;
+        return this.retrieverLayer.search(query, scope);
     }
 
     async get(path: string, options: MemoryGetOptions | undefined, scope: MemoryScope): Promise<MemoryGetResult> {
-        const resolved = this.normalizeGetRequest(path, options);
-        if (!resolved.path) {
-            throw new Error('memory_get path is required');
-        }
-
-        if (resolved.path.startsWith('session_events/')) {
-            return this.readSessionEvent(resolved.path, resolved.range, scope);
-        }
-
-        return this.readMemoryFile(resolved.path, resolved.range, scope);
-    }
-
-    private normalizeGetRequest(
-        path: string,
-        options: MemoryGetOptions | undefined,
-    ): { path: string; range: { from: number; lines: number } } {
-        const rawPath = (path || '').trim();
-        let normalizedPath = rawPath
-            .replace(/^`+|`+$/g, '')
-            .trim();
-
-        if (/^\[.+\]$/u.test(normalizedPath)) {
-            normalizedPath = normalizedPath.slice(1, -1).trim();
-        }
-
-        let inferredFrom: number | undefined;
-        const lineSuffixMatch = normalizedPath.match(/^(.*):(\d+)(?::\d+)?$/u);
-        if (lineSuffixMatch) {
-            const basePath = lineSuffixMatch[1]?.trim() ?? '';
-            const fromLine = Number(lineSuffixMatch[2]);
-            if (basePath && Number.isSafeInteger(fromLine) && fromLine > 0) {
-                normalizedPath = basePath;
-                inferredFrom = fromLine;
-            }
-        }
-
-        const range = this.normalizeGetRange({
-            ...options,
-            from: options?.from ?? inferredFrom,
-        });
-        return {
-            path: normalizedPath,
-            range,
-        };
-    }
-
-    private normalizeGetRange(options?: MemoryGetOptions): { from: number; lines: number } {
-        const from = Math.max(1, Math.floor(options?.from ?? 1));
-        const requestedLines = Math.floor(options?.lines ?? DEFAULT_MEMORY_GET_LINES);
-        const lines = Math.max(1, Math.min(MAX_MEMORY_GET_LINES, requestedLines));
-        return { from, lines };
+        return this.retrieverLayer.get(path, options, scope);
     }
 
     private splitLinesWithRange(
@@ -2288,110 +1981,15 @@ export class MemoryRuntime {
     }
 
     async save(content: string, target: 'daily' | 'long-term', scope: MemoryScope): Promise<MemorySaveResult> {
-        const now = new Date();
-        const timestamp = formatTimeStamp(now);
-        const entry = `\n[${timestamp}] ${content}\n`;
-
-        const dailyDate = formatLocalDate(now);
-        const paths = this.resolveScopePaths(scope);
-        const targetPath = target === 'daily'
-            ? join(paths.dailyDir, `${dailyDate}.md`)
-            : paths.longTermPath;
-
-        if (!existsSync(paths.dailyDir)) {
-            mkdirSync(paths.dailyDir, { recursive: true });
-        }
-
-        if (!existsSync(targetPath)) {
-            const header = target === 'daily'
-                ? `# Daily Memory - ${dailyDate} (${scope.key})\n`
-                : `# Long-term Memory (${scope.key})\n\n`;
-            writeFileSync(targetPath, header, 'utf-8');
-        }
-
-        await appendFile(targetPath, entry, 'utf-8');
-
-        if (this.canUsePg()) {
-            await this.syncIncremental({ onlyPaths: [targetPath], force: true });
-        }
-
-        return {
-            path: targetPath,
-            scope: scope.key,
-        };
+        return this.storeLayer.save(content, target, scope);
     }
 
     async saveHeartbeat(content: string, scope: MemoryScope, category?: string): Promise<MemorySaveResult> {
-        const text = content.trim();
-        if (!text) {
-            throw new Error('heartbeat_save content is empty');
-        }
-
-        const now = new Date();
-        const timestamp = formatTimeStamp(now);
-        const paths = this.resolveScopePaths(scope);
-        const heartbeatPath = paths.heartbeatPath;
-
-        if (!existsSync(paths.scopeRoot)) {
-            mkdirSync(paths.scopeRoot, { recursive: true });
-        }
-
-        if (!existsSync(heartbeatPath)) {
-            writeFileSync(heartbeatPath, `# Heartbeat (${scope.key})\n\n`, 'utf-8');
-        }
-
-        const normalizedCategory = (category || 'lesson').trim();
-        const entry = [
-            '',
-            `## [${timestamp}] ${normalizedCategory}`,
-            text,
-            '',
-        ].join('\n');
-        await appendFile(heartbeatPath, entry, 'utf-8');
-
-        if (this.canUsePg()) {
-            await this.syncIncremental({ onlyPaths: [heartbeatPath], force: true });
-        }
-
-        return {
-            path: heartbeatPath,
-            scope: scope.key,
-        };
+        return this.storeLayer.saveHeartbeat(content, scope, category);
     }
 
     async appendTranscript(scope: MemoryScope, role: 'user' | 'assistant', content: string): Promise<void> {
-        if (!this.memoryConfig.transcript.enabled) {
-            return;
-        }
-
-        const text = content.trim();
-        if (!text) {
-            return;
-        }
-
-        const maxChars = this.memoryConfig.transcript.max_chars_per_entry;
-        const clipped = text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
-
-        const now = new Date();
-        const dailyDate = formatLocalDate(now);
-        const timestamp = formatTimeStamp(now);
-        const transcriptDir = join(this.workspacePath, 'memory', 'scopes', scope.key, 'transcripts');
-        const transcriptPath = join(transcriptDir, `${dailyDate}.md`);
-
-        if (!existsSync(transcriptDir)) {
-            mkdirSync(transcriptDir, { recursive: true });
-        }
-
-        if (!existsSync(transcriptPath)) {
-            writeFileSync(transcriptPath, `# Session Transcript - ${dailyDate} (${scope.key})\n`, 'utf-8');
-        }
-
-        const roleLabel = role === 'assistant' ? 'assistant' : 'user';
-        await appendFile(transcriptPath, `\n[${timestamp}] [${roleLabel}] ${clipped}\n`, 'utf-8');
-
-        if (this.canUsePg()) {
-            this.schedulePathSync([transcriptPath]);
-        }
+        return this.storeLayer.appendTranscript(scope, role, content);
     }
 
     private resolveScopePaths(scope: MemoryScope): {
@@ -2400,23 +1998,7 @@ export class MemoryRuntime {
         longTermPath: string;
         heartbeatPath: string;
     } {
-        if (scope.key === 'main') {
-            const scopeRoot = join(this.workspacePath, 'memory', 'scopes', 'main');
-            return {
-                scopeRoot,
-                dailyDir: join(this.workspacePath, 'memory'),
-                longTermPath: join(this.workspacePath, 'MEMORY.md'),
-                heartbeatPath: join(scopeRoot, 'HEARTBEAT.md'),
-            };
-        }
-
-        const scopeRoot = join(this.workspacePath, 'memory', 'scopes', scope.key);
-        return {
-            scopeRoot,
-            dailyDir: scopeRoot,
-            longTermPath: join(scopeRoot, 'LONG_TERM.md'),
-            heartbeatPath: join(scopeRoot, 'HEARTBEAT.md'),
-        };
+        return this.storeLayer.resolveScopePaths(scope);
     }
 
     private async searchFromFiles(query: string, scope: MemoryScope): Promise<MemorySearchHit[]> {

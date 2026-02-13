@@ -59,7 +59,7 @@ import {
 import { HumanMessage as LCHumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { withDingTalkConversationContext, consumeQueuedDingTalkReplyFiles } from './context.js';
-import { resolveMemoryScope } from '../../middleware/memory-scope.js';
+import { resolveMemoryScope, type MemoryScope } from '../../middleware/memory-scope.js';
 import { DingTalkSessionStore, createSessionThreadId } from './session-store.js';
 import { buildPromptBootstrapMessage } from '../../prompt/bootstrap.js';
 
@@ -1769,24 +1769,151 @@ async function handleMessageInternal(
     data: DingTalkInboundMessage,
     ctx: MessageHandlerContext
 ): Promise<void> {
-    const { config, dingtalkConfig, log } = ctx;
+    const { config, log } = ctx;
     const persistedSessionStore = await getSessionStore(config, log);
+    const isDirect = data.conversationType === '1';
+    const senderId = data.senderStaffId || data.senderId;
+    let currentCard: AICardInstance | null = null;
+    let downloadedMediaPath: string | undefined;
 
     // Clean up expired sessions periodically
     await cleanupSessions(persistedSessionStore, log);
     cleanupCardCache();
 
+    try {
+        const normalizedStage = await runInboundNormalizeStage({
+            data,
+            ctx,
+            persistedSessionStore,
+        });
+        if (!normalizedStage) {
+            return;
+        }
+
+        const mediaEnrichedStage = await runMediaEnrichStage(normalizedStage);
+        if (!mediaEnrichedStage) {
+            return;
+        }
+        downloadedMediaPath = mediaEnrichedStage.downloadedMediaPath;
+
+        const invokeStage = await runAgentInvokeStage(mediaEnrichedStage);
+        currentCard = invokeStage.currentCard;
+
+        await runOutboundRenderStage(mediaEnrichedStage, invokeStage);
+        await runPersistenceStage(mediaEnrichedStage, invokeStage);
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const dingtalkConfig = ctx.dingtalkConfig;
+        log.error(`[DingTalk] Error processing message: ${errorMessage}`);
+        const err = error as {
+            name?: string;
+            code?: string;
+            status?: number;
+            response?: { status?: number; data?: unknown; config?: { url?: string; method?: string } };
+            config?: { url?: string; method?: string };
+            stack?: string;
+        };
+        const safeStringify = (value: unknown) => {
+            try {
+                return JSON.stringify(value);
+            } catch {
+                return '"[unserializable]"';
+            }
+        };
+        const cause = (err as { cause?: unknown })?.cause;
+        log.error(
+            `[DingTalk] Error details: ${safeStringify({
+                name: err?.name,
+                code: err?.code,
+                status: err?.status ?? err?.response?.status,
+                url: err?.response?.config?.url || err?.config?.url,
+                method: err?.response?.config?.method || err?.config?.method,
+                data: err?.response?.data,
+                cause: cause && typeof cause === 'object' ? cause : String(cause ?? ''),
+                stack: err?.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : undefined,
+            })}`
+        );
+
+        // If card mode failed, try to finalize with error
+        if (currentCard && !isCardFinished(currentCard)) {
+            try {
+                await finishAICard(currentCard, `❌ 处理出错: ${errorMessage}`, dingtalkConfig, log);
+            } catch (finishErr) {
+                log.debug('[DingTalk] Failed to finalize error card:', String(finishErr));
+            }
+        }
+
+        try {
+            await sendBySession(
+                dingtalkConfig,
+                data.sessionWebhook,
+                `❌ 处理消息时出错: ${errorMessage}`,
+                { atUserId: !isDirect ? senderId : null },
+                log
+            );
+        } catch (sendErr) {
+            log.error('[DingTalk] Failed to send error message:', String(sendErr));
+        }
+    } finally {
+        if (downloadedMediaPath) {
+            const mediaPathToRemove = downloadedMediaPath;
+            try {
+                await import('node:fs/promises').then((fsPromises) => fsPromises.unlink(mediaPathToRemove));
+            } catch {
+                // ignore cleanup errors
+            }
+        }
+    }
+}
+
+interface InboundNormalizeStageResult {
+    data: DingTalkInboundMessage;
+    ctx: MessageHandlerContext;
+    persistedSessionStore: DingTalkSessionStore | null;
+    content: MessageContent;
+    isDirect: boolean;
+    senderId: string;
+    senderName: string;
+    conversationId: string;
+    scope: MemoryScope;
+    session: SessionState;
+    memoryWorkspacePath: string;
+}
+
+interface MediaEnrichStageResult extends InboundNormalizeStageResult {
+    downloadedMediaPath?: string;
+}
+
+interface AgentInvokeStageResult {
+    currentCard: AICardInstance | null;
+    fullResponse: string;
+    responseFiles: string[];
+    requestedFilesFromUser: string[];
+    shouldSendMarkdownReply: boolean;
+    flushState: MemoryFlushState;
+    compactionModel: BaseChatModel;
+    compactionConfig: CompactionConfig;
+}
+
+async function runInboundNormalizeStage(params: {
+    data: DingTalkInboundMessage;
+    ctx: MessageHandlerContext;
+    persistedSessionStore: DingTalkSessionStore | null;
+}): Promise<InboundNormalizeStageResult | null> {
+    const { data, ctx, persistedSessionStore } = params;
+    const { config, dingtalkConfig, log } = ctx;
+
     // Ignore bot self-messages
     if (data.senderId === data.chatbotUserId || data.senderStaffId === data.chatbotUserId) {
         log.debug('[DingTalk] Ignoring robot self-message');
-        return;
+        return null;
     }
 
     // Extract message content
     const content = extractMessageContent(data);
     if (!content.text) {
         log.debug('[DingTalk] Empty message content, ignoring');
-        return;
+        return null;
     }
 
     const isDirect = data.conversationType === '1';
@@ -1794,6 +1921,7 @@ async function handleMessageInternal(
     const senderName = data.senderNick || 'Unknown';
     const conversationId = data.conversationId;
     const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+    const memoryWorkspacePath = path.resolve(process.cwd(), config.agent.workspace);
 
     // Get or create session for this conversation
     const session = await getOrCreateSession({
@@ -1812,7 +1940,7 @@ async function handleMessageInternal(
         senderId,
     });
     if (handledModelCommand) {
-        return;
+        return null;
     }
 
     const audioPreprocess = preprocessAudioMessage({
@@ -1828,8 +1956,29 @@ async function handleMessageInternal(
             { atUserId: !isDirect ? senderId : null },
             log
         );
-        return;
+        return null;
     }
+
+    return {
+        data,
+        ctx,
+        persistedSessionStore,
+        content,
+        isDirect,
+        senderId,
+        senderName,
+        conversationId,
+        scope,
+        session,
+        memoryWorkspacePath,
+    };
+}
+
+async function runMediaEnrichStage(
+    stage: InboundNormalizeStageResult
+): Promise<MediaEnrichStageResult | null> {
+    const { data, ctx, content, isDirect, senderId, conversationId } = stage;
+    const { config, dingtalkConfig, log } = ctx;
 
     let downloadedMediaPath: string | undefined;
     if (content.mediaPath && dingtalkConfig.robotCode) {
@@ -1860,7 +2009,7 @@ async function handleMessageInternal(
         log,
     });
     if (approvalHandled) {
-        return;
+        return null;
     }
 
     // If there is a pending approval in this conversation, block new requests.
@@ -1872,8 +2021,32 @@ async function handleMessageInternal(
             { atUserId: !isDirect ? senderId : null },
             log
         );
-        return;
+        return null;
     }
+
+    return {
+        ...stage,
+        downloadedMediaPath,
+    };
+}
+
+async function runAgentInvokeStage(
+    stage: MediaEnrichStageResult
+): Promise<AgentInvokeStageResult> {
+    const {
+        data,
+        ctx,
+        persistedSessionStore,
+        content,
+        isDirect,
+        senderId,
+        senderName,
+        conversationId,
+        scope,
+        session,
+        memoryWorkspacePath,
+    } = stage;
+    const { config, dingtalkConfig, log } = ctx;
 
     log.info(`[DingTalk] Received message from ${senderName}: "${content.text.slice(0, 50)}${content.text.length > 50 ? '...' : ''}"`);
 
@@ -1884,7 +2057,6 @@ async function handleMessageInternal(
     // Update token count with user input
     flushState = updateTokenCount(flushState, content.text);
     session.totalInputTokens += estimateTokens(content.text);
-    const memoryWorkspacePath = path.resolve(process.cwd(), config.agent.workspace);
     await persistSessionEvent({
         role: 'user',
         content: content.text,
@@ -1960,446 +2132,408 @@ async function handleMessageInternal(
         }
     }
 
-    try {
-        // Invoke agent with streaming for card mode
-        const enforceMemorySearch = hasMemoryRecallIntent(content.text);
-        if (enforceMemorySearch) {
-            log.info('[DingTalk] Memory recall intent detected, enforce memory_search preflight');
-        }
-        const shouldInjectStartupMemory = !hydratedThreadIds.has(session.threadId) && session.messageHistory.length === 0;
-        const shouldInjectBootstrap = !hydratedThreadIds.has(session.threadId);
-        const startupMemoryInjection = shouldInjectStartupMemory
-            ? await buildSessionStartupMemoryInjection({
-                workspacePath: memoryWorkspacePath,
-                scopeKey: scope.key,
-            })
-            : null;
-        const bootstrapPromptMessage = shouldInjectBootstrap
-            ? await buildPromptBootstrapMessage({
-                workspacePath: memoryWorkspacePath,
-                scopeKey: scope.key,
-            })
-            : null;
-        if (startupMemoryInjection) {
-            log.info(`[DingTalk] Startup memory injection enabled for ${session.threadId}, chars=${startupMemoryInjection.length}`);
-        }
-        if (bootstrapPromptMessage) {
-            log.info(`[DingTalk] Prompt bootstrap injected for ${session.threadId}, chars=${bootstrapPromptMessage.content.length}, scope=${scope.key}`);
-        }
-        const invocationMessages = buildAgentInvocationMessages(session, content.text, {
-            enforceMemorySearch,
-            startupMemoryInjection,
-            bootstrapPromptMessage,
-        });
-        const agentConfig = {
-            configurable: { thread_id: session.threadId },
-            recursionLimit: config.agent.recursion_limit,
+    const enforceMemorySearch = hasMemoryRecallIntent(content.text);
+    if (enforceMemorySearch) {
+        log.info('[DingTalk] Memory recall intent detected, enforce memory_search preflight');
+    }
+    const shouldInjectStartupMemory = !hydratedThreadIds.has(session.threadId) && session.messageHistory.length === 0;
+    const shouldInjectBootstrap = !hydratedThreadIds.has(session.threadId);
+    const startupMemoryInjection = shouldInjectStartupMemory
+        ? await buildSessionStartupMemoryInjection({
+            workspacePath: memoryWorkspacePath,
+            scopeKey: scope.key,
+        })
+        : null;
+    const bootstrapPromptMessage = shouldInjectBootstrap
+        ? await buildPromptBootstrapMessage({
+            workspacePath: memoryWorkspacePath,
+            scopeKey: scope.key,
+        })
+        : null;
+    if (startupMemoryInjection) {
+        log.info(`[DingTalk] Startup memory injection enabled for ${session.threadId}, chars=${startupMemoryInjection.length}`);
+    }
+    if (bootstrapPromptMessage) {
+        log.info(`[DingTalk] Prompt bootstrap injected for ${session.threadId}, chars=${bootstrapPromptMessage.content.length}, scope=${scope.key}`);
+    }
+    const invocationMessages = buildAgentInvocationMessages(session, content.text, {
+        enforceMemorySearch,
+        startupMemoryInjection,
+        bootstrapPromptMessage,
+    });
+    const agentConfig = {
+        configurable: { thread_id: session.threadId },
+        recursionLimit: config.agent.recursion_limit,
+    };
+
+    log.debug(`[DingTalk] Invoking agent with thread_id: ${session.threadId}`);
+
+    let fullResponse = '';
+    let rawStreamResponse = '';
+    let finalOutputFromEvents = '';
+    let lastToolOutputFromEvents = '';
+    let sawToolCall = false;
+    let responseFiles: string[] = [];
+    let shouldSendMarkdownReply = false;
+    const workspaceRoot = memoryWorkspacePath;
+    const requestedFilesFromUser = await collectRequestedFilesFromUser({
+        userText: content.text,
+        workspaceRoot,
+        log,
+    });
+    if (requestedFilesFromUser.length > 0) {
+        log.info(`[DingTalk] User requested file return, matched files: ${requestedFilesFromUser.join(', ')}`);
+    }
+
+    if (currentCard) {
+        // Card mode: use streaming
+        log.info('[DingTalk] Starting streamEvents...');
+
+        const eventStream = ctx.agent.streamEvents(
+            { messages: invocationMessages },
+            { ...agentConfig, version: 'v2' }
+        );
+
+        log.info('[DingTalk] EventStream created, waiting for events...');
+
+        let lastStreamTime = Date.now();
+        const STREAM_THROTTLE = 500; // Minimum ms between stream updates
+        const STREAM_MIN_CHARS = 40; // Minimum chars between updates
+        let eventCount = 0;
+        let lastFlushedLength = 0;
+        let pendingFlush: NodeJS.Timeout | null = null;
+        let flushInFlight = false;
+        let flushQueuedFinal = false;
+        let streamFlushError: unknown = null;
+
+        const markStreamError = (err: unknown) => {
+            if (!streamFlushError) {
+                streamFlushError = err;
+            }
         };
 
-        log.debug(`[DingTalk] Invoking agent with thread_id: ${session.threadId}`);
+        const flushNow = async (final: boolean) => {
+            if (flushInFlight || !currentCard) {
+                flushQueuedFinal = flushQueuedFinal || final;
+                return;
+            }
+            const currentLength = fullResponse.length;
+            if (!final && currentLength - lastFlushedLength < STREAM_MIN_CHARS) {
+                return;
+            }
+            flushInFlight = true;
+            try {
+                await streamAICard(currentCard, fullResponse, final, dingtalkConfig, log);
+                lastStreamTime = Date.now();
+                lastFlushedLength = fullResponse.length;
+            } catch (streamErr) {
+                markStreamError(streamErr);
+                log.warn('[DingTalk] Card stream update failed:', String(streamErr));
+            } finally {
+                flushInFlight = false;
+                if (flushQueuedFinal) {
+                    flushQueuedFinal = false;
+                    await flushNow(true);
+                }
+            }
+        };
 
-        let fullResponse = '';
-        let rawStreamResponse = '';
-        let finalOutputFromEvents = '';
-        let lastToolOutputFromEvents = '';
-        let sawToolCall = false;
-        let responseFiles: string[] = [];
-        const workspaceRoot = memoryWorkspacePath;
-        const requestedFilesFromUser = await collectRequestedFilesFromUser({
-            userText: content.text,
+        const scheduleFlush = (final: boolean = false) => {
+            if (final) flushQueuedFinal = true;
+            if (pendingFlush) return;
+            const now = Date.now();
+            const delay = Math.max(0, STREAM_THROTTLE - (now - lastStreamTime));
+            pendingFlush = setTimeout(() => {
+                pendingFlush = null;
+                void flushNow(final);
+            }, delay);
+        };
+
+        const waitForStreamDrain = async (timeoutMs: number) => {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+                if (!flushInFlight && !pendingFlush && !flushQueuedFinal) {
+                    return;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+        };
+
+        for await (const event of eventStream) {
+            eventCount++;
+            if (eventCount <= 3 || eventCount % 10 === 0) {
+                log.debug(`[DingTalk] Event #${eventCount}: ${event.event}`);
+            }
+
+            if (event.event === 'on_chat_model_stream') {
+                const chunk = event.data?.chunk;
+                if (chunk?.content) {
+                    let text = '';
+                    if (typeof chunk.content === 'string') {
+                        text = chunk.content;
+                    } else if (Array.isArray(chunk.content)) {
+                        for (const item of chunk.content) {
+                            if (item.type === 'text' && item.text) {
+                                text += item.text;
+                            }
+                        }
+                    }
+
+                    rawStreamResponse += text;
+                    const cleanedCandidate = sanitizeAssistantReplyText(rawStreamResponse);
+                    const shouldSuppressStreamCandidate = sawToolCall && (
+                        isLikelyToolCallResidue(cleanedCandidate) || isLikelyStructuredToolPayload(cleanedCandidate)
+                    );
+                    if (!shouldSuppressStreamCandidate) {
+                        fullResponse = cleanedCandidate;
+                    }
+
+                    // Throttle stream updates to avoid rate limiting
+                    scheduleFlush(false);
+                }
+            } else if (event.event === 'on_tool_start') {
+                const toolName = event.name;
+                sawToolCall = true;
+                log.info(`[DingTalk] Tool started: ${toolName}`);
+            } else if (event.event === 'on_tool_end') {
+                const toolOutput = sanitizeAssistantReplyText(extractReplyTextFromEventData(event.data));
+                if (toolOutput) {
+                    lastToolOutputFromEvents = toolOutput;
+                }
+            } else if (event.event === 'on_chat_model_end' || event.event === 'on_chain_end') {
+                const extracted = sanitizeAssistantReplyText(extractReplyTextFromEventData(event.data));
+                if (extracted && !isLikelyToolCallResidue(extracted) && !isLikelyStructuredToolPayload(extracted)) {
+                    finalOutputFromEvents = extracted;
+                }
+                const eventData = event.data as { output?: { messages?: unknown[] }; messages?: unknown[] } | undefined;
+                const outputMessages = Array.isArray(eventData?.output?.messages)
+                    ? eventData.output.messages
+                    : Array.isArray(eventData?.messages)
+                        ? eventData.messages
+                        : null;
+                if (outputMessages) {
+                    const bestFromMessages = extractBestReadableReplyFromMessages(outputMessages);
+                    if (bestFromMessages) {
+                        finalOutputFromEvents = bestFromMessages;
+                    }
+                }
+            }
+        }
+
+        fullResponse = pickBestUserFacingResponse([
+            finalOutputFromEvents,
+            fullResponse,
+            rawStreamResponse,
+        ], {
+            sawToolCall,
+        });
+        if (!fullResponse) {
+            log.warn(
+                `[DingTalk] Stream reply did not produce user-facing text. ` +
+                `tool_called=${sawToolCall} raw_len=${rawStreamResponse.length} ` +
+                `chain_len=${finalOutputFromEvents.length} tool_len=${lastToolOutputFromEvents.length}`
+            );
+            if (sawToolCall) {
+                fullResponse = '我已完成工具查询，但结果整理失败。请让我重试一次，我会给你结构化结论。';
+            }
+        }
+
+        log.info(`[DingTalk] Stream completed, total events: ${eventCount}, response length: ${fullResponse.length}`);
+        const extractedReply = await collectReplyFiles({
+            responseText: fullResponse,
             workspaceRoot,
             log,
         });
-        if (requestedFilesFromUser.length > 0) {
-            log.info(`[DingTalk] User requested file return, matched files: ${requestedFilesFromUser.join(', ')}`);
+        fullResponse = extractedReply.cleanedText;
+        responseFiles = extractedReply.files;
+        const queuedToolFiles = await resolveExistingReplyFiles({
+            candidates: consumeQueuedDingTalkReplyFiles(),
+            workspaceRoot,
+            log,
+            cleanedText: fullResponse,
+        });
+        responseFiles = mergeFilePaths([...responseFiles, ...queuedToolFiles.files]);
+        if (!fullResponse && responseFiles.length > 0) {
+            fullResponse = '✅ 文件已生成并回传，请查收附件。';
         }
 
-        if (currentCard) {
-            // Card mode: use streaming
-            log.info('[DingTalk] Starting streamEvents...');
-
-            const eventStream = ctx.agent.streamEvents(
-                { messages: invocationMessages },
-                { ...agentConfig, version: 'v2' }
-            );
-
-            log.info('[DingTalk] EventStream created, waiting for events...');
-
-            let lastStreamTime = Date.now();
-            const STREAM_THROTTLE = 500; // Minimum ms between stream updates
-            const STREAM_MIN_CHARS = 40; // Minimum chars between updates
-            let eventCount = 0;
-            let lastFlushedLength = 0;
-            let pendingFlush: NodeJS.Timeout | null = null;
-            let flushInFlight = false;
-            let flushQueuedFinal = false;
-            let streamFlushError: unknown = null;
-
-            const markStreamError = (err: unknown) => {
-                if (!streamFlushError) {
-                    streamFlushError = err;
-                }
-            };
-
-            const flushNow = async (final: boolean) => {
-                if (flushInFlight || !currentCard) {
-                    flushQueuedFinal = flushQueuedFinal || final;
-                    return;
-                }
-                const currentLength = fullResponse.length;
-                if (!final && currentLength - lastFlushedLength < STREAM_MIN_CHARS) {
-                    return;
-                }
-                flushInFlight = true;
-                try {
-                    await streamAICard(currentCard, fullResponse, final, dingtalkConfig, log);
-                    lastStreamTime = Date.now();
-                    lastFlushedLength = fullResponse.length;
-                } catch (streamErr) {
-                    markStreamError(streamErr);
-                    log.warn('[DingTalk] Card stream update failed:', String(streamErr));
-                } finally {
-                    flushInFlight = false;
-                    if (flushQueuedFinal) {
-                        flushQueuedFinal = false;
-                        await flushNow(true);
-                    }
-                }
-            };
-
-            const scheduleFlush = (final: boolean = false) => {
-                if (final) flushQueuedFinal = true;
-                if (pendingFlush) return;
-                const now = Date.now();
-                const delay = Math.max(0, STREAM_THROTTLE - (now - lastStreamTime));
-                pendingFlush = setTimeout(() => {
-                    pendingFlush = null;
-                    void flushNow(final);
-                }, delay);
-            };
-
-            const waitForStreamDrain = async (timeoutMs: number) => {
-                const start = Date.now();
-                while (Date.now() - start < timeoutMs) {
-                    if (!flushInFlight && !pendingFlush && !flushQueuedFinal) {
-                        return;
-                    }
-                    await new Promise((resolve) => setTimeout(resolve, 50));
-                }
-            };
-
-            for await (const event of eventStream) {
-                eventCount++;
-                if (eventCount <= 3 || eventCount % 10 === 0) {
-                    log.debug(`[DingTalk] Event #${eventCount}: ${event.event}`);
-                }
-
-                if (event.event === 'on_chat_model_stream') {
-                    const chunk = event.data?.chunk;
-                    if (chunk?.content) {
-                        let text = '';
-                        if (typeof chunk.content === 'string') {
-                            text = chunk.content;
-                        } else if (Array.isArray(chunk.content)) {
-                            for (const item of chunk.content) {
-                                if (item.type === 'text' && item.text) {
-                                    text += item.text;
-                                }
-                            }
-                        }
-
-                        rawStreamResponse += text;
-                        const cleanedCandidate = sanitizeAssistantReplyText(rawStreamResponse);
-                        const shouldSuppressStreamCandidate = sawToolCall && (
-                            isLikelyToolCallResidue(cleanedCandidate) || isLikelyStructuredToolPayload(cleanedCandidate)
-                        );
-                        if (!shouldSuppressStreamCandidate) {
-                            fullResponse = cleanedCandidate;
-                        }
-
-                        // Throttle stream updates to avoid rate limiting
-                        scheduleFlush(false);
-                    }
-                } else if (event.event === 'on_tool_start') {
-                    const toolName = event.name;
-                    sawToolCall = true;
-                    log.info(`[DingTalk] Tool started: ${toolName}`);
-                } else if (event.event === 'on_tool_end') {
-                    const toolOutput = sanitizeAssistantReplyText(extractReplyTextFromEventData(event.data));
-                    if (toolOutput) {
-                        lastToolOutputFromEvents = toolOutput;
-                    }
-                } else if (event.event === 'on_chat_model_end' || event.event === 'on_chain_end') {
-                    const extracted = sanitizeAssistantReplyText(extractReplyTextFromEventData(event.data));
-                    if (extracted && !isLikelyToolCallResidue(extracted) && !isLikelyStructuredToolPayload(extracted)) {
-                        finalOutputFromEvents = extracted;
-                    }
-                    const eventData = event.data as { output?: { messages?: unknown[] }; messages?: unknown[] } | undefined;
-                    const outputMessages = Array.isArray(eventData?.output?.messages)
-                        ? eventData.output.messages
-                        : Array.isArray(eventData?.messages)
-                            ? eventData.messages
-                            : null;
-                    if (outputMessages) {
-                        const bestFromMessages = extractBestReadableReplyFromMessages(outputMessages);
-                        if (bestFromMessages) {
-                            finalOutputFromEvents = bestFromMessages;
-                        }
-                    }
-                }
+        // Finalize card
+        let shouldFallbackToSessionMessage = false;
+        if (fullResponse) {
+            log.info('[DingTalk] Finalizing AI Card...');
+            if (pendingFlush) {
+                clearTimeout(pendingFlush);
+                pendingFlush = null;
             }
+            await flushNow(true);
+            await waitForStreamDrain(2500);
 
-            fullResponse = pickBestUserFacingResponse([
-                finalOutputFromEvents,
-                fullResponse,
-                rawStreamResponse,
-            ], {
-                sawToolCall,
-            });
-            if (!fullResponse) {
-                log.warn(
-                    `[DingTalk] Stream reply did not produce user-facing text. ` +
-                    `tool_called=${sawToolCall} raw_len=${rawStreamResponse.length} ` +
-                    `chain_len=${finalOutputFromEvents.length} tool_len=${lastToolOutputFromEvents.length}`
-                );
-                if (sawToolCall) {
-                    fullResponse = '我已完成工具查询，但结果整理失败。请让我重试一次，我会给你结构化结论。';
-                }
-            }
-
-            log.info(`[DingTalk] Stream completed, total events: ${eventCount}, response length: ${fullResponse.length}`);
-            const extractedReply = await collectReplyFiles({
-                responseText: fullResponse,
-                workspaceRoot,
-                log,
-            });
-            fullResponse = extractedReply.cleanedText;
-            responseFiles = extractedReply.files;
-            const queuedToolFiles = await resolveExistingReplyFiles({
-                candidates: consumeQueuedDingTalkReplyFiles(),
-                workspaceRoot,
-                log,
-                cleanedText: fullResponse,
-            });
-            responseFiles = mergeFilePaths([...responseFiles, ...queuedToolFiles.files]);
-            if (!fullResponse && responseFiles.length > 0) {
-                fullResponse = '✅ 文件已生成并回传，请查收附件。';
-            }
-
-            // Finalize card
-            let shouldFallbackToSessionMessage = false;
-            if (fullResponse) {
-                log.info('[DingTalk] Finalizing AI Card...');
-                if (pendingFlush) {
-                    clearTimeout(pendingFlush);
-                    pendingFlush = null;
-                }
-                await flushNow(true);
-                await waitForStreamDrain(2500);
-
-                const cardState = currentCard.state as AICardState;
-                if (streamFlushError || cardState === AICardStatus.FAILED) {
-                    shouldFallbackToSessionMessage = true;
-                    log.warn(
-                        `[DingTalk] Card finalization incomplete (state=${cardState}), falling back to session markdown reply`
-                    );
-                } else if (cardState !== AICardStatus.FINISHED) {
-                    log.warn(
-                        `[DingTalk] Card finalization state still ${cardState}; skip markdown fallback to avoid duplicate reply`
-                    );
-                } else {
-                    log.info('[DingTalk] AI Card finalized successfully');
-                }
-            } else {
-                log.warn('[DingTalk] No response content to send');
-                fullResponse = '抱歉，我暂时没有生成有效回复，请稍后重试。';
+            const cardState = currentCard.state as AICardState;
+            if (streamFlushError || cardState === AICardStatus.FAILED) {
                 shouldFallbackToSessionMessage = true;
-            }
-
-            if (shouldFallbackToSessionMessage) {
-                await sendBySession(
-                    dingtalkConfig,
-                    data.sessionWebhook,
-                    fullResponse,
-                    {
-                        useMarkdown: true,
-                        atUserId: !isDirect ? senderId : null,
-                    },
-                    log
+                log.warn(
+                    `[DingTalk] Card finalization incomplete (state=${cardState}), falling back to session markdown reply`
                 );
+            } else if (cardState !== AICardStatus.FINISHED) {
+                log.warn(
+                    `[DingTalk] Card finalization state still ${cardState}; skip markdown fallback to avoid duplicate reply`
+                );
+            } else {
+                log.info('[DingTalk] AI Card finalized successfully');
             }
         } else {
-            // Markdown mode: use invoke
-            const result = await ctx.agent.invoke(
-                { messages: invocationMessages },
-                agentConfig
-            );
-
-            // Extract response
-            const messages = result.messages;
-            if (Array.isArray(messages) && messages.length > 0) {
-                const lastMessage = messages[messages.length - 1];
-                fullResponse = typeof lastMessage.content === 'string'
-                    ? lastMessage.content
-                    : JSON.stringify(lastMessage.content);
-            }
-            fullResponse = pickBestUserFacingResponse([
-                fullResponse,
-                Array.isArray(messages) ? extractBestReadableReplyFromMessages(messages) : '',
-            ]);
-
-            if (!fullResponse) {
-                fullResponse = '抱歉，我没有生成有效的回复。';
-            }
-            const extractedReply = await collectReplyFiles({
-                responseText: fullResponse,
-                workspaceRoot,
-                log,
-            });
-            fullResponse = extractedReply.cleanedText;
-            responseFiles = extractedReply.files;
-            const queuedToolFiles = await resolveExistingReplyFiles({
-                candidates: consumeQueuedDingTalkReplyFiles(),
-                workspaceRoot,
-                log,
-                cleanedText: fullResponse,
-            });
-            responseFiles = mergeFilePaths([...responseFiles, ...queuedToolFiles.files]);
-            if (!fullResponse && responseFiles.length > 0) {
-                fullResponse = '✅ 文件已生成并回传，请查收附件。';
-            }
-
-            // Send response back to DingTalk
-            log.info(`[DingTalk] Sending response (${fullResponse.length} chars) to ${senderName}`);
-
-            await sendBySession(
-                dingtalkConfig,
-                data.sessionWebhook,
-                fullResponse,
-                {
-                    useMarkdown: true,
-                    atUserId: !isDirect ? senderId : null,
-                },
-                log
-            );
+            log.warn('[DingTalk] No response content to send');
+            fullResponse = '抱歉，我暂时没有生成有效回复，请稍后重试。';
+            shouldFallbackToSessionMessage = true;
         }
+        shouldSendMarkdownReply = shouldFallbackToSessionMessage;
+    } else {
+        // Markdown mode: use invoke
+        const result = await ctx.agent.invoke(
+            { messages: invocationMessages },
+            agentConfig
+        );
 
-        await sendReplyFiles({
-            dingtalkConfig,
-            conversationId,
-            senderId,
-            isDirect,
-            sessionWebhook: data.sessionWebhook,
-            filePaths: mergeFilePaths([...requestedFilesFromUser, ...responseFiles]),
+        // Extract response
+        const messages = result.messages;
+        if (Array.isArray(messages) && messages.length > 0) {
+            const lastMessage = messages[messages.length - 1];
+            fullResponse = typeof lastMessage.content === 'string'
+                ? lastMessage.content
+                : JSON.stringify(lastMessage.content);
+        }
+        fullResponse = pickBestUserFacingResponse([
+            fullResponse,
+            Array.isArray(messages) ? extractBestReadableReplyFromMessages(messages) : '',
+        ]);
+
+        if (!fullResponse) {
+            fullResponse = '抱歉，我没有生成有效的回复。';
+        }
+        const extractedReply = await collectReplyFiles({
+            responseText: fullResponse,
+            workspaceRoot,
             log,
         });
-        hydratedThreadIds.add(session.threadId);
+        fullResponse = extractedReply.cleanedText;
+        responseFiles = extractedReply.files;
+        const queuedToolFiles = await resolveExistingReplyFiles({
+            candidates: consumeQueuedDingTalkReplyFiles(),
+            workspaceRoot,
+            log,
+            cleanedText: fullResponse,
+        });
+        responseFiles = mergeFilePaths([...responseFiles, ...queuedToolFiles.files]);
+        if (!fullResponse && responseFiles.length > 0) {
+            fullResponse = '✅ 文件已生成并回传，请查收附件。';
+        }
+        shouldSendMarkdownReply = true;
+    }
 
-        // Update token count and message history
-        flushState = updateTokenCount(flushState, fullResponse);
-        session.totalOutputTokens += estimateTokens(fullResponse);
-        await persistSessionEvent({
-            role: 'assistant',
-            content: fullResponse,
-            conversationId,
-            sessionKey: scope.key,
+    return {
+        currentCard,
+        fullResponse,
+        responseFiles,
+        requestedFilesFromUser,
+        shouldSendMarkdownReply,
+        flushState,
+        compactionModel,
+        compactionConfig,
+    };
+}
+
+async function runOutboundRenderStage(
+    stage: MediaEnrichStageResult,
+    invokeStage: AgentInvokeStageResult
+): Promise<void> {
+    const { data, ctx, senderName, isDirect, senderId, conversationId, session } = stage;
+    const { dingtalkConfig, log } = ctx;
+
+    if (invokeStage.shouldSendMarkdownReply) {
+        log.info(`[DingTalk] Sending response (${invokeStage.fullResponse.length} chars) to ${senderName}`);
+        await sendBySession(
+            dingtalkConfig,
+            data.sessionWebhook,
+            invokeStage.fullResponse,
+            {
+                useMarkdown: true,
+                atUserId: !isDirect ? senderId : null,
+            },
+            log
+        );
+    }
+
+    await sendReplyFiles({
+        dingtalkConfig,
+        conversationId,
+        senderId,
+        isDirect,
+        sessionWebhook: data.sessionWebhook,
+        filePaths: mergeFilePaths([...invokeStage.requestedFilesFromUser, ...invokeStage.responseFiles]),
+        log,
+    });
+    hydratedThreadIds.add(session.threadId);
+}
+
+async function runPersistenceStage(
+    stage: MediaEnrichStageResult,
+    invokeStage: AgentInvokeStageResult
+): Promise<void> {
+    const {
+        ctx,
+        persistedSessionStore,
+        content,
+        conversationId,
+        scope,
+        session,
+        memoryWorkspacePath,
+    } = stage;
+    const { config, log } = ctx;
+    const fullResponse = invokeStage.fullResponse;
+    let flushState = updateTokenCount(invokeStage.flushState, fullResponse);
+
+    // Update token count and message history
+    session.totalOutputTokens += estimateTokens(fullResponse);
+    await persistSessionEvent({
+        role: 'assistant',
+        content: fullResponse,
+        conversationId,
+        sessionKey: scope.key,
+        store: persistedSessionStore,
+        workspacePath: memoryWorkspacePath,
+        config,
+        log,
+    });
+    const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
+    session.messageHistory.push(new HumanMessage(content.text));
+    session.messageHistory.push(new AIMessage(fullResponse));
+    session.totalTokens = flushState.totalTokens;
+    session.lastUpdated = Date.now();
+
+    // Check auto-compaction after response
+    flushState = await executeAutoCompact(
+        ctx.agent,
+        session,
+        flushState,
+        invokeStage.compactionModel,
+        invokeStage.compactionConfig,
+        log,
+        {
             store: persistedSessionStore,
+            sessionKey: scope.key,
+            conversationId,
             workspacePath: memoryWorkspacePath,
             config,
-            log,
-        });
-        const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
-        session.messageHistory.push(new HumanMessage(content.text));
-        session.messageHistory.push(new AIMessage(fullResponse));
-        session.totalTokens = flushState.totalTokens;
-        session.lastUpdated = Date.now();
-
-        // Check auto-compaction after response
-        flushState = await executeAutoCompact(
-            ctx.agent,
-            session,
-            flushState,
-            compactionModel,
-            compactionConfig,
-            log,
-            {
-                store: persistedSessionStore,
-                sessionKey: scope.key,
-                conversationId,
-                workspacePath: memoryWorkspacePath,
-                config,
-            }
-        );
-        session.totalTokens = flushState.totalTokens;
-        await persistSession({
-            sessionKey: scope.key,
-            scopeKey: scope.key,
-            session,
-            store: persistedSessionStore,
-            log,
-        });
-
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        log.error(`[DingTalk] Error processing message: ${errorMessage}`);
-        const err = error as {
-            name?: string;
-            code?: string;
-            status?: number;
-            response?: { status?: number; data?: unknown; config?: { url?: string; method?: string } };
-            config?: { url?: string; method?: string };
-            stack?: string;
-        };
-        const safeStringify = (value: unknown) => {
-            try {
-                return JSON.stringify(value);
-            } catch {
-                return '"[unserializable]"';
-            }
-        };
-        const cause = (err as { cause?: unknown })?.cause;
-        log.error(
-            `[DingTalk] Error details: ${safeStringify({
-                name: err?.name,
-                code: err?.code,
-                status: err?.status ?? err?.response?.status,
-                url: err?.response?.config?.url || err?.config?.url,
-                method: err?.response?.config?.method || err?.config?.method,
-                data: err?.response?.data,
-                cause: cause && typeof cause === 'object' ? cause : String(cause ?? ''),
-                stack: err?.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : undefined,
-            })}`
-        );
-
-        // If card mode failed, try to finalize with error
-        if (currentCard && !isCardFinished(currentCard)) {
-            try {
-                await finishAICard(currentCard, `❌ 处理出错: ${errorMessage}`, dingtalkConfig, log);
-            } catch (finishErr) {
-                log.debug('[DingTalk] Failed to finalize error card:', String(finishErr));
-            }
         }
-
-        try {
-            await sendBySession(
-                dingtalkConfig,
-                data.sessionWebhook,
-                `❌ 处理消息时出错: ${errorMessage}`,
-                { atUserId: !isDirect ? senderId : null },
-                log
-            );
-        } catch (sendErr) {
-            log.error('[DingTalk] Failed to send error message:', String(sendErr));
-        }
-    } finally {
-        if (downloadedMediaPath) {
-            try {
-                await import('node:fs/promises').then((fsPromises) => fsPromises.unlink(downloadedMediaPath));
-            } catch {
-                // ignore cleanup errors
-            }
-        }
-    }
+    );
+    session.totalTokens = flushState.totalTokens;
+    await persistSession({
+        sessionKey: scope.key,
+        scopeKey: scope.key,
+        session,
+        store: persistedSessionStore,
+        log,
+    });
 }
 
 /**
