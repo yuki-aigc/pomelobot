@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import {
     createDeepAgent,
     FilesystemBackend,
@@ -21,8 +20,34 @@ import { createCronTools } from './cron/tools.js';
 import { createDingTalkFileReturnTools } from './channels/dingtalk/file-return-tools.js';
 
 // Define return type to avoid complex type inference issues
+export interface RuntimeAgentInvokeResult {
+    messages?: Array<{ content?: unknown }>;
+    [key: string]: unknown;
+}
+
+export interface RuntimeAgentStreamEvent {
+    event: string;
+    name?: string;
+    data?: {
+        chunk?: {
+            content?: string | Array<{ type?: string; text?: string }>;
+        };
+        output?: {
+            messages?: unknown[];
+        };
+        messages?: unknown[];
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
+export interface RuntimeAgent {
+    invoke: (input: unknown, options?: unknown) => Promise<RuntimeAgentInvokeResult>;
+    streamEvents: (input: unknown, options?: unknown) => AsyncIterable<RuntimeAgentStreamEvent>;
+}
+
 export interface AgentContext {
-    agent: any;  // Use any to bypass complex LangGraph type inference
+    agent: RuntimeAgent;
     config: Config;
     cleanup: () => Promise<void>;
 }
@@ -95,8 +120,7 @@ function buildToolSummaryLines(
 async function persistExecAudit(
     type: ExecAuditEventType,
     callId: string,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    data: Record<string, any>
+    data: Record<string, unknown>
 ): Promise<void> {
     try {
         await writeExecAuditEvent({
@@ -481,17 +505,18 @@ ${memoryContext}
 ${mcpServersHint}`;
 
     // Create the agent with FilesystemBackend and memory tools
-    let agent: any;
+    let agent: RuntimeAgent;
     try {
-        agent = await createDeepAgent({
+        const createdAgent = await createDeepAgent({
             model,
             systemPrompt,
-            tools: allTools as any,  // Memory tools + exec tool + MCP tools
-            subagents: subagents as any,
+            tools: allTools,
+            subagents,
             backend: () => new FilesystemBackend({ rootDir: workspacePath }),
             skills: [skillsPath],
             checkpointer,
         });
+        agent = createdAgent as unknown as RuntimeAgent;
     } catch (error) {
         await mcpBootstrap.close();
         throw error;

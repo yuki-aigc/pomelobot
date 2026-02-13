@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import type { Config } from '../config.js';

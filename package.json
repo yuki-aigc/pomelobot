@@ -15,7 +15,9 @@
         "start:server": "node dist/server.js",
         "start:channels": "node dist/server.js",
         "start:ios": "node dist/ios.js",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "test": "tsx --test \"src/**/*.test.ts\"",
+        "test:watch": "tsx --test --watch \"src/**/*.test.ts\""
     },
     "keywords": [
         "deepagents",

@@ -49,6 +49,7 @@ import {
 } from '../../compaction/index.js';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { Config } from '../../config.js';
+import type { RuntimeAgent } from '../../agent.js';
 import {
     createChatModel,
     getActiveModelEntry,
@@ -1457,8 +1458,7 @@ async function buildMediaContext(params: {
 }
 
 export interface MessageHandlerContext {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: any;
+    agent: RuntimeAgent;
     config: Config;
     dingtalkConfig: DingTalkConfig;
     log: Logger;
@@ -2540,8 +2540,7 @@ async function runPersistenceStage(
  * Execute memory flush
  */
 async function executeMemoryFlush(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: any,
+    agent: RuntimeAgent,
     session: SessionState,
     flushState: MemoryFlushState,
     log: Logger,
@@ -2593,8 +2592,7 @@ async function executeMemoryFlush(
  * Execute auto-compaction if needed
  */
 async function executeAutoCompact(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: any,
+    agent: RuntimeAgent,
     session: SessionState,
     flushState: MemoryFlushState,
     compactionModel: BaseChatModel,
@@ -2676,8 +2674,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: 
 }
 
 export async function flushSessionsOnShutdown(params: {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: any;
+    agent: RuntimeAgent;
     config: Config;
     log: Logger;
     drainTimeoutMs?: number;

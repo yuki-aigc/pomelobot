@@ -13,7 +13,6 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import type { ExecApprovalRequest } from './agent.js';
 import { loadConfig } from './config.js';
-import { getActiveModelName } from './llm.js';
 import { ConversationRuntime } from './conversation/runtime.js';
 import {
     handleMessage,
@@ -31,20 +30,13 @@ import { setCronService } from './cron/runtime.js';
 import { resolveCronStorePath } from './cron/store.js';
 import type { CronJob } from './cron/types.js';
 import type { RuntimeLogWriter } from './log/runtime.js';
-
-// ANSI terminal colors
-const colors = {
-    reset: '\x1b[0m',
-    bright: '\x1b[1m',
-    dim: '\x1b[2m',
-    gray: '\x1b[90m',
-    white: '\x1b[37m',
-    green: '\x1b[32m',
-    yellow: '\x1b[33m',
-    red: '\x1b[31m',
-    orange: '\x1b[38;5;208m',
-    cyan: '\x1b[36m',
-};
+import {
+    createRuntimeConsoleLogger,
+    extractAgentResponseText,
+    printChannelHeader,
+    terminalColors as colors,
+    toGatewayLogger,
+} from './channels/runtime-entry.js';
 
 const AUTO_MEMORY_SAVE_JOB_NAME = '系统任务：每日记忆归档(04:00)';
 const AUTO_MEMORY_SAVE_JOB_MARKER = '[system:auto-memory-save-4am:v1]';
@@ -195,93 +187,6 @@ async function ensureAutoMemorySaveJob(params: {
     }
 }
 
-/**
- * Create logger for DingTalk channel
- */
-function createLogger(debug: boolean = false, logWriter?: RuntimeLogWriter): Logger {
-    return {
-        debug: (message: string, ...args: unknown[]) => {
-            logWriter?.write('DEBUG', message, args);
-            if (debug) {
-                console.log(`${colors.gray}${message}${colors.reset}`, ...args);
-            }
-        },
-        info: (message: string, ...args: unknown[]) => {
-            logWriter?.write('INFO', message, args);
-            console.log(`${colors.cyan}${message}${colors.reset}`, ...args);
-        },
-        warn: (message: string, ...args: unknown[]) => {
-            logWriter?.write('WARN', message, args);
-            console.warn(`${colors.yellow}${message}${colors.reset}`, ...args);
-        },
-        error: (message: string, ...args: unknown[]) => {
-            logWriter?.write('ERROR', message, args);
-            console.error(`${colors.red}${message}${colors.reset}`, ...args);
-        },
-    };
-}
-
-/**
- * Print startup header
- */
-function printHeader(config: ReturnType<typeof loadConfig>) {
-    const model = getActiveModelName(config);
-
-    const o = colors.orange;
-    const r = colors.reset;
-    const g = colors.gray;
-    const b = colors.bright;
-    const rd = colors.red;
-    const c = colors.cyan;
-
-    console.log();
-    console.log(`     ${o}▄▄▄▄▄${r}        ${b}SRE Bot${r} ${g}v1.0.0${r} ${c}[DingTalk Mode]${r}`);
-    console.log(`   ${o}█ ${r}●   ●${o} █      ${g}${model}${r}`);
-    console.log(`   ${o}█ ${rd}      ${o}█      ${g}Memory & Skills Enabled${r}`);
-    console.log(`    ${o}▀▀▀▀▀▀▀${r}       ${g}Stream Mode (No Public IP Required)${r}`);
-    console.log(`     ${g}▀   ▀${r}`);
-    console.log();
-}
-
-function extractTextContent(content: unknown): string {
-    if (typeof content === 'string') {
-        return content.trim();
-    }
-    if (!Array.isArray(content)) {
-        return '';
-    }
-    const blocks: string[] = [];
-    for (const block of content) {
-        if (typeof block === 'string') {
-            blocks.push(block);
-            continue;
-        }
-        if (!block || typeof block !== 'object') {
-            continue;
-        }
-        const text = (block as { text?: unknown }).text;
-        if (typeof text === 'string' && text.trim()) {
-            blocks.push(text);
-        }
-    }
-    return blocks.join('\n').trim();
-}
-
-function extractAgentResponseText(result: unknown): string {
-    if (!result || typeof result !== 'object') {
-        return '';
-    }
-    const messages = (result as { messages?: unknown }).messages;
-    if (!Array.isArray(messages) || messages.length === 0) {
-        return '';
-    }
-    const lastMessage = messages[messages.length - 1] as { content?: unknown } | undefined;
-    if (!lastMessage) {
-        return '';
-    }
-    return extractTextContent(lastMessage.content);
-}
-
 function buildCronDeliveryChannel(job: CronJob): string {
     return job.delivery.channel?.trim().toLowerCase() || 'dingtalk';
 }
@@ -321,10 +226,20 @@ export async function startDingTalkService(options?: {
         throw new Error('Please replace placeholder DingTalk credentials in config.json');
     }
 
-    printHeader(config);
+    printChannelHeader({
+        config,
+        modeLabel: 'DingTalk Mode',
+        statusLines: [
+            'Memory & Skills Enabled',
+            'Stream Mode (No Public IP Required)',
+        ],
+    });
 
     // Create logger
-    const log = createLogger(dingtalkConfig.debug, options?.logWriter);
+    const log: Logger = createRuntimeConsoleLogger({
+        debug: dingtalkConfig.debug,
+        logWriter: options?.logWriter,
+    });
 
     // Create agent
     log.info('[DingTalk] Initializing agent...');
@@ -374,12 +289,7 @@ export async function startDingTalkService(options?: {
             useMarkdown: dingtalkConfig.cron?.useMarkdown,
             title: dingtalkConfig.cron?.title,
         },
-        logger: {
-            debug: (message: string, ...args: unknown[]) => log.debug(message, ...args),
-            info: (message: string, ...args: unknown[]) => log.info(message, ...args),
-            warn: (message: string, ...args: unknown[]) => log.warn(message, ...args),
-            error: (message: string, ...args: unknown[]) => log.error(message, ...args),
-        },
+        logger: toGatewayLogger(log),
         runJob: async (job) => {
             const deliveryChannel = buildCronDeliveryChannel(job);
             if (deliveryChannel !== 'dingtalk') {
@@ -479,12 +389,7 @@ export async function startDingTalkService(options?: {
             );
             return { skipReply: true };
         },
-        logger: {
-            debug: (message: string, ...args: unknown[]) => log.debug(message, ...args),
-            info: (message: string, ...args: unknown[]) => log.info(message, ...args),
-            warn: (message: string, ...args: unknown[]) => log.warn(message, ...args),
-            error: (message: string, ...args: unknown[]) => log.error(message, ...args),
-        },
+        logger: toGatewayLogger(log),
     });
     const dingtalkAdapter = createDingTalkChannelAdapter({
         config: dingtalkConfig,
