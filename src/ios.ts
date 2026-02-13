@@ -3,7 +3,6 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { createAgent } from './agent.js';
 import { loadConfig } from './config.js';
-import { getActiveModelName } from './llm.js';
 import { createIOSChannelAdapter } from './channels/ios/index.js';
 import type { IOSLogger } from './channels/ios/index.js';
 import { GatewayService } from './channels/gateway/index.js';
@@ -14,95 +13,13 @@ import type { CronJob } from './cron/types.js';
 import type { RuntimeLogWriter } from './log/runtime.js';
 import { buildPromptBootstrapMessage } from './prompt/bootstrap.js';
 import { resolveMemoryScope } from './middleware/memory-scope.js';
-
-const colors = {
-    reset: '\x1b[0m',
-    gray: '\x1b[90m',
-    cyan: '\x1b[36m',
-    yellow: '\x1b[33m',
-    red: '\x1b[31m',
-    orange: '\x1b[38;5;208m',
-    bright: '\x1b[1m',
-};
-
-function createLogger(debug = false, logWriter?: RuntimeLogWriter): IOSLogger {
-    return {
-        debug: (message: string, ...args: unknown[]) => {
-            logWriter?.write('DEBUG', message, args);
-            if (debug) {
-                console.log(`${colors.gray}${message}${colors.reset}`, ...args);
-            }
-        },
-        info: (message: string, ...args: unknown[]) => {
-            logWriter?.write('INFO', message, args);
-            console.log(`${colors.cyan}${message}${colors.reset}`, ...args);
-        },
-        warn: (message: string, ...args: unknown[]) => {
-            logWriter?.write('WARN', message, args);
-            console.warn(`${colors.yellow}${message}${colors.reset}`, ...args);
-        },
-        error: (message: string, ...args: unknown[]) => {
-            logWriter?.write('ERROR', message, args);
-            console.error(`${colors.red}${message}${colors.reset}`, ...args);
-        },
-    };
-}
-
-function printHeader(config: ReturnType<typeof loadConfig>) {
-    const model = getActiveModelName(config);
-
-    const o = colors.orange;
-    const r = colors.reset;
-    const g = colors.gray;
-    const b = colors.bright;
-    const c = colors.cyan;
-
-    console.log();
-    console.log(`     ${o}▄▄▄▄▄${r}        ${b}SRE Bot${r} ${g}v1.0.0${r} ${c}[iOS Mode]${r}`);
-    console.log(`   ${o}█${r} ●   ● ${o}█${r}      ${g}${model}${r}`);
-    console.log(`   ${o}█${r}       ${o}█${r}      ${g}WebSocket Gateway Enabled${r}`);
-    console.log(`    ${o}▀▀▀▀▀▀▀${r}`);
-    console.log();
-}
-
-function extractTextContent(content: unknown): string {
-    if (typeof content === 'string') {
-        return content.trim();
-    }
-    if (!Array.isArray(content)) {
-        return '';
-    }
-    const blocks: string[] = [];
-    for (const block of content) {
-        if (typeof block === 'string') {
-            blocks.push(block);
-            continue;
-        }
-        if (!block || typeof block !== 'object') {
-            continue;
-        }
-        const text = (block as { text?: unknown }).text;
-        if (typeof text === 'string' && text.trim()) {
-            blocks.push(text);
-        }
-    }
-    return blocks.join('\n').trim();
-}
-
-function extractAgentResponseText(result: unknown): string {
-    if (!result || typeof result !== 'object') {
-        return '';
-    }
-    const messages = (result as { messages?: unknown }).messages;
-    if (!Array.isArray(messages) || messages.length === 0) {
-        return '';
-    }
-    const lastMessage = messages[messages.length - 1] as { content?: unknown } | undefined;
-    if (!lastMessage) {
-        return '';
-    }
-    return extractTextContent(lastMessage.content);
-}
+import {
+    createRuntimeConsoleLogger,
+    extractAgentResponseText,
+    printChannelHeader,
+    terminalColors as colors,
+    toGatewayLogger,
+} from './channels/runtime-entry.js';
 
 function buildCronDeliveryTarget(job: CronJob, config: ReturnType<typeof loadConfig>): string | undefined {
     const fromJob = job.delivery.target?.trim();
@@ -141,9 +58,16 @@ export async function startIOSService(options?: {
     }
 
     const iosConfig = config.ios;
-    const log = createLogger(iosConfig.debug, options?.logWriter);
+    const log: IOSLogger = createRuntimeConsoleLogger({
+        debug: iosConfig.debug,
+        logWriter: options?.logWriter,
+    });
 
-    printHeader(config);
+    printChannelHeader({
+        config,
+        modeLabel: 'iOS Mode',
+        statusLines: ['WebSocket Gateway Enabled'],
+    });
 
     log.info('[iOS] Initializing agent...');
     const initialAgentContext = await createAgent(config, {
@@ -207,12 +131,7 @@ export async function startIOSService(options?: {
                 },
             };
         },
-        logger: {
-            debug: (message: string, ...args: unknown[]) => log.debug(message, ...args),
-            info: (message: string, ...args: unknown[]) => log.info(message, ...args),
-            warn: (message: string, ...args: unknown[]) => log.warn(message, ...args),
-            error: (message: string, ...args: unknown[]) => log.error(message, ...args),
-        },
+        logger: toGatewayLogger(log),
     });
 
     const iosAdapter = createIOSChannelAdapter({ config: iosConfig, log });
@@ -230,12 +149,7 @@ export async function startIOSService(options?: {
             useMarkdown: iosConfig.cron?.useMarkdown,
             title: iosConfig.cron?.title,
         },
-        logger: {
-            debug: (message: string, ...args: unknown[]) => log.debug(message, ...args),
-            info: (message: string, ...args: unknown[]) => log.info(message, ...args),
-            warn: (message: string, ...args: unknown[]) => log.warn(message, ...args),
-            error: (message: string, ...args: unknown[]) => log.error(message, ...args),
-        },
+        logger: toGatewayLogger(log),
         runJob: async (job) => {
             const deliveryChannel = job.delivery.channel?.trim().toLowerCase() || 'ios';
             if (deliveryChannel !== 'ios') {

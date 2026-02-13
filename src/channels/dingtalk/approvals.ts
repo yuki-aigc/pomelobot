@@ -184,65 +184,96 @@ function extractApprovalFromCallback(payload: Record<string, unknown>): {
     approverName?: string;
 } {
     const normalized = normalizeCallbackPayload(payload);
+    const asRecord = (value: unknown): Record<string, unknown> | undefined => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+            return undefined;
+        }
+        return value as Record<string, unknown>;
+    };
+    const toStringValue = (value: unknown): string | undefined =>
+        typeof value === 'string' && value.trim() ? value : undefined;
+    const firstDefined = (...values: Array<string | undefined>): string | undefined =>
+        values.find((value) => value !== undefined);
+
     // Card callbacks have multiple possible payload shapes; use permissive parsing.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const n = normalized as Record<string, any>;
+    const n = normalized as Record<string, unknown>;
+    const nCardPrivateData = asRecord(n.cardPrivateData);
+    const nCardPrivateDataParams = asRecord(nCardPrivateData?.params);
+    const nContent = asRecord(n.content);
+    const nContentCardPrivateData = asRecord(nContent?.cardPrivateData);
+    const nContentCardPrivateDataParams = asRecord(nContentCardPrivateData?.params);
+    const nValue = asRecord(n.value);
+    const nValueCardPrivateData = asRecord(nValue?.cardPrivateData);
+    const nValueCardPrivateDataParams = asRecord(nValueCardPrivateData?.params);
+    const nCardAction = asRecord(n.cardAction);
+    const nCardActionValue = asRecord(nCardAction?.value);
+    const nCallbackValue = asRecord(n.callbackValue);
+    const nCardData = asRecord(n.cardData);
+    const nCardDataCardParamMap = asRecord(nCardData?.cardParamMap);
+    const nCardParamMap = asRecord(n.cardParamMap);
+
     const actionRaw =
         n.actionId ||
         n.actionKey ||
         n.action ||
         (Array.isArray(n.actionIds) ? n.actionIds[0] : undefined) ||
         // DingTalk card callbacks commonly wrap action info in cardPrivateData.
-        (Array.isArray(n.cardPrivateData?.actionIds) ? n.cardPrivateData.actionIds[0] : undefined) ||
-        n.cardPrivateData?.params?.actionId ||
-        (Array.isArray(n.content?.cardPrivateData?.actionIds) ? n.content.cardPrivateData.actionIds[0] : undefined) ||
-        n.content?.cardPrivateData?.params?.actionId ||
-        (Array.isArray(n.value?.cardPrivateData?.actionIds) ? n.value.cardPrivateData.actionIds[0] : undefined) ||
-        n.value?.cardPrivateData?.params?.actionId ||
-        n.cardAction?.actionId ||
-        n.cardAction?.actionKey ||
-        n.cardAction?.action ||
-        n.cardAction?.value?.actionId ||
-        n.cardAction?.value?.actionKey ||
-        n.cardAction?.value?.action ||
-        n.callbackValue?.actionId ||
-        n.callbackValue?.actionKey ||
-        n.callbackValue?.action ||
-        n.value?.action ||
-        n.content?.action;
+        (Array.isArray(nCardPrivateData?.actionIds) ? nCardPrivateData.actionIds[0] : undefined) ||
+        nCardPrivateDataParams?.actionId ||
+        (Array.isArray(nContentCardPrivateData?.actionIds) ? nContentCardPrivateData.actionIds[0] : undefined) ||
+        nContentCardPrivateDataParams?.actionId ||
+        (Array.isArray(nValueCardPrivateData?.actionIds) ? nValueCardPrivateData.actionIds[0] : undefined) ||
+        nValueCardPrivateDataParams?.actionId ||
+        nCardAction?.actionId ||
+        nCardAction?.actionKey ||
+        nCardAction?.action ||
+        nCardActionValue?.actionId ||
+        nCardActionValue?.actionKey ||
+        nCardActionValue?.action ||
+        nCallbackValue?.actionId ||
+        nCallbackValue?.actionKey ||
+        nCallbackValue?.action ||
+        nValue?.action ||
+        nContent?.action;
 
     const action = normalizeAction(actionRaw);
     const actionDecision =
         action && action.includes('approve') ? 'approve' : action && action.includes('reject') ? 'reject' : undefined;
 
-    const cardInstanceId =
-        (n.cardInstanceId as string | undefined) ||
-        (n.cardInstanceID as string | undefined) ||
-        (n.outTrackId as string | undefined);
+    const cardInstanceId = firstDefined(
+        toStringValue(n.cardInstanceId),
+        toStringValue(n.cardInstanceID),
+        toStringValue(n.outTrackId),
+    );
 
-    const approvalId =
-        (n.approvalId as string | undefined) ||
-        (n.cardData?.cardParamMap?.approvalId as string | undefined) ||
-        (n.cardParamMap?.approvalId as string | undefined);
-    const callId =
-        (n.callId as string | undefined) ||
-        (n.cardData?.cardParamMap?.callId as string | undefined) ||
-        (n.cardParamMap?.callId as string | undefined);
-    const comment =
-        (n.comment as string | undefined) ||
-        (n.reason as string | undefined) ||
-        (n.remark as string | undefined) ||
-        (n.cardData?.cardParamMap?.comment as string | undefined) ||
-        (n.cardParamMap?.comment as string | undefined);
-    const approverId =
-        (n.staffId as string | undefined) ||
-        (n.userId as string | undefined) ||
-        (n.operatorId as string | undefined) ||
-        (n.operatorStaffId as string | undefined);
-    const approverName =
-        (n.operatorName as string | undefined) ||
-        (n.nick as string | undefined) ||
-        (n.senderNick as string | undefined);
+    const approvalId = firstDefined(
+        toStringValue(n.approvalId),
+        toStringValue(nCardDataCardParamMap?.approvalId),
+        toStringValue(nCardParamMap?.approvalId),
+    );
+    const callId = firstDefined(
+        toStringValue(n.callId),
+        toStringValue(nCardDataCardParamMap?.callId),
+        toStringValue(nCardParamMap?.callId),
+    );
+    const comment = firstDefined(
+        toStringValue(n.comment),
+        toStringValue(n.reason),
+        toStringValue(n.remark),
+        toStringValue(nCardDataCardParamMap?.comment),
+        toStringValue(nCardParamMap?.comment),
+    );
+    const approverId = firstDefined(
+        toStringValue(n.staffId),
+        toStringValue(n.userId),
+        toStringValue(n.operatorId),
+        toStringValue(n.operatorStaffId),
+    );
+    const approverName = firstDefined(
+        toStringValue(n.operatorName),
+        toStringValue(n.nick),
+        toStringValue(n.senderNick),
+    );
 
     return { approvalId, callId, action: actionDecision, cardInstanceId, comment, approverId, approverName };
 }

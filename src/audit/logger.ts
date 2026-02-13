@@ -11,8 +11,7 @@ export interface ExecAuditEvent {
     timestamp: string;
     type: ExecAuditEventType;
     callId: string;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    data: Record<string, any>;
+    data: Record<string, unknown>;
 }
 
 function getDateString(date = new Date()): string {

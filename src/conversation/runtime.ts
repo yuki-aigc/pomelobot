@@ -4,6 +4,7 @@ import type {
     AgentRuntimeChannel,
     CreateAgentOptions,
     ExecApprovalPrompt,
+    RuntimeAgent,
 } from '../agent.js';
 import type { Config } from '../config.js';
 import {
@@ -51,7 +52,7 @@ export class ConversationRuntime {
         this.agentContext = await this.createAgentContext();
     }
 
-    getAgent(): any {
+    getAgent(): RuntimeAgent {
         const ctx = this.agentContext;
         if (!ctx) {
             throw new Error('ConversationRuntime has not been initialized');
