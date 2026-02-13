@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 import { createAgent } from './agent.js';
 import { loadConfig } from './config.js';
 import { getActiveModelName } from './llm.js';
@@ -11,6 +12,8 @@ import { getCronService, setCronService } from './cron/runtime.js';
 import { resolveCronStorePath } from './cron/store.js';
 import type { CronJob } from './cron/types.js';
 import type { RuntimeLogWriter } from './log/runtime.js';
+import { buildPromptBootstrapMessage } from './prompt/bootstrap.js';
+import { resolveMemoryScope } from './middleware/memory-scope.js';
 
 const colors = {
     reset: '\x1b[0m',
@@ -151,6 +154,8 @@ export async function startIOSService(options?: {
     let cleanup = initialAgentContext.cleanup;
     let gateway: GatewayService | null = null;
     let cronService: CronService | null = null;
+    const bootstrappedThreads = new Set<string>();
+    const memoryWorkspacePath = resolve(process.cwd(), config.agent.workspace);
 
     gateway = new GatewayService({
         onProcessInbound: async (message) => {
@@ -168,14 +173,25 @@ export async function startIOSService(options?: {
             }
 
             const threadId = `ios-${message.conversationId}`;
+            const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+            const invocationMessages: Array<{ role: 'user'; content: string }> = [];
+            if (!bootstrappedThreads.has(threadId)) {
+                const bootstrapPromptMessage = await buildPromptBootstrapMessage({
+                    workspacePath: memoryWorkspacePath,
+                    scopeKey: scope.key,
+                });
+                if (bootstrapPromptMessage) {
+                    invocationMessages.push(bootstrapPromptMessage);
+                }
+                bootstrappedThreads.add(threadId);
+            }
+            invocationMessages.push({
+                role: 'user',
+                content: userText,
+            });
             const invokeResult = await currentAgent.invoke(
                 {
-                    messages: [
-                        {
-                            role: 'user',
-                            content: userText,
-                        },
-                    ],
+                    messages: invocationMessages,
                 },
                 {
                     configurable: { thread_id: threadId },
@@ -238,14 +254,21 @@ export async function startIOSService(options?: {
             }
 
             const threadId = `cron-ios-${job.id}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+            const cronMessages: Array<{ role: 'user'; content: string }> = [];
+            const bootstrapPromptMessage = await buildPromptBootstrapMessage({
+                workspacePath: memoryWorkspacePath,
+                scopeKey: 'main',
+            });
+            if (bootstrapPromptMessage) {
+                cronMessages.push(bootstrapPromptMessage);
+            }
+            cronMessages.push({
+                role: 'user',
+                content: `[定时任务 ${job.name}] ${job.payload.message}`,
+            });
             const invokeResult = await currentAgent.invoke(
                 {
-                    messages: [
-                        {
-                            role: 'user',
-                            content: `[定时任务 ${job.name}] ${job.payload.message}`,
-                        },
-                    ],
+                    messages: cronMessages,
                 },
                 {
                     configurable: { thread_id: threadId },

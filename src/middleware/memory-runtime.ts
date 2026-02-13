@@ -24,7 +24,7 @@ const TEMPORAL_RECENT_DAYS = 7;
 const SESSION_VECTOR_TEXT_MAX_CHARS = 1600;
 const SESSION_EVENTS_TTL_DELETE_BATCH = 2000;
 
-type MemorySourceType = 'daily' | 'long-term' | 'transcript' | 'session';
+type MemorySourceType = 'daily' | 'long-term' | 'transcript' | 'session' | 'heartbeat';
 
 interface FileMetaRow {
     scope_key: string;
@@ -208,6 +208,9 @@ function inferSourceType(relPath: string): MemorySourceType {
     const name = basename(normalized);
     if (normalized.includes('/transcripts/')) {
         return 'transcript';
+    }
+    if (name === 'heartbeat.md') {
+        return 'heartbeat';
     }
     if (name === 'memory.md' || name === 'long_term.md') {
         return 'long-term';
@@ -1009,10 +1012,14 @@ export class MemoryRuntime {
     private async listIndexableFiles(): Promise<string[]> {
         const files: string[] = [];
         const longTermMain = join(this.workspacePath, 'MEMORY.md');
+        const heartbeatMain = join(this.workspacePath, 'HEARTBEAT.md');
         const memoryDir = join(this.workspacePath, 'memory');
 
         if (existsSync(longTermMain)) {
             files.push(longTermMain);
+        }
+        if (existsSync(heartbeatMain)) {
+            files.push(heartbeatMain);
         }
 
         if (existsSync(memoryDir)) {
@@ -1744,6 +1751,9 @@ export class MemoryRuntime {
             if (normalized === 'MEMORY.md') {
                 return true;
             }
+            if (normalized === 'HEARTBEAT.md') {
+                return true;
+            }
             if (/^memory\/[^/]+\.md$/u.test(normalized)) {
                 return true;
             }
@@ -2311,6 +2321,44 @@ export class MemoryRuntime {
         };
     }
 
+    async saveHeartbeat(content: string, scope: MemoryScope, category?: string): Promise<MemorySaveResult> {
+        const text = content.trim();
+        if (!text) {
+            throw new Error('heartbeat_save content is empty');
+        }
+
+        const now = new Date();
+        const timestamp = formatTimeStamp(now);
+        const paths = this.resolveScopePaths(scope);
+        const heartbeatPath = paths.heartbeatPath;
+
+        if (!existsSync(paths.scopeRoot)) {
+            mkdirSync(paths.scopeRoot, { recursive: true });
+        }
+
+        if (!existsSync(heartbeatPath)) {
+            writeFileSync(heartbeatPath, `# Heartbeat (${scope.key})\n\n`, 'utf-8');
+        }
+
+        const normalizedCategory = (category || 'lesson').trim();
+        const entry = [
+            '',
+            `## [${timestamp}] ${normalizedCategory}`,
+            text,
+            '',
+        ].join('\n');
+        await appendFile(heartbeatPath, entry, 'utf-8');
+
+        if (this.canUsePg()) {
+            await this.syncIncremental({ onlyPaths: [heartbeatPath], force: true });
+        }
+
+        return {
+            path: heartbeatPath,
+            scope: scope.key,
+        };
+    }
+
     async appendTranscript(scope: MemoryScope, role: 'user' | 'assistant', content: string): Promise<void> {
         if (!this.memoryConfig.transcript.enabled) {
             return;
@@ -2346,18 +2394,28 @@ export class MemoryRuntime {
         }
     }
 
-    private resolveScopePaths(scope: MemoryScope): { dailyDir: string; longTermPath: string } {
+    private resolveScopePaths(scope: MemoryScope): {
+        scopeRoot: string;
+        dailyDir: string;
+        longTermPath: string;
+        heartbeatPath: string;
+    } {
         if (scope.key === 'main') {
+            const scopeRoot = join(this.workspacePath, 'memory', 'scopes', 'main');
             return {
+                scopeRoot,
                 dailyDir: join(this.workspacePath, 'memory'),
                 longTermPath: join(this.workspacePath, 'MEMORY.md'),
+                heartbeatPath: join(scopeRoot, 'HEARTBEAT.md'),
             };
         }
 
         const scopeRoot = join(this.workspacePath, 'memory', 'scopes', scope.key);
         return {
+            scopeRoot,
             dailyDir: scopeRoot,
             longTermPath: join(scopeRoot, 'LONG_TERM.md'),
+            heartbeatPath: join(scopeRoot, 'HEARTBEAT.md'),
         };
     }
 
@@ -2366,10 +2424,16 @@ export class MemoryRuntime {
         const results: MemorySearchHit[] = [];
 
         const scopePaths = this.resolveScopePaths(scope);
-        const files: string[] = [];
+        const fileSet = new Set<string>();
 
         if (existsSync(scopePaths.longTermPath)) {
-            files.push(scopePaths.longTermPath);
+            fileSet.add(scopePaths.longTermPath);
+        }
+        if (scope.key === 'main') {
+            const heartbeatMainPath = join(this.workspacePath, 'HEARTBEAT.md');
+            if (existsSync(heartbeatMainPath)) {
+                fileSet.add(heartbeatMainPath);
+            }
         }
 
         if (existsSync(scopePaths.dailyDir)) {
@@ -2377,20 +2441,36 @@ export class MemoryRuntime {
                 const entries = await readdir(scopePaths.dailyDir, { withFileTypes: true }).catch(() => []);
                 for (const entry of entries) {
                     if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-                    files.push(join(scopePaths.dailyDir, entry.name));
+                    fileSet.add(join(scopePaths.dailyDir, entry.name));
+                }
+                if (existsSync(scopePaths.scopeRoot)) {
+                    const scopedMainFiles: string[] = [];
+                    await walkMarkdownFiles(scopePaths.scopeRoot, scopedMainFiles);
+                    for (const file of scopedMainFiles) {
+                        fileSet.add(file);
+                    }
                 }
             } else {
-                await walkMarkdownFiles(scopePaths.dailyDir, files);
+                const scopedFiles: string[] = [];
+                await walkMarkdownFiles(scopePaths.dailyDir, scopedFiles);
+                for (const file of scopedFiles) {
+                    fileSet.add(file);
+                }
             }
         }
 
         if (this.memoryConfig.transcript.enabled && scope.key === 'main') {
             const transcriptDir = join(this.workspacePath, 'memory', 'scopes', scope.key, 'transcripts');
             if (existsSync(transcriptDir)) {
-                await walkMarkdownFiles(transcriptDir, files);
+                const transcriptFiles: string[] = [];
+                await walkMarkdownFiles(transcriptDir, transcriptFiles);
+                for (const file of transcriptFiles) {
+                    fileSet.add(file);
+                }
             }
         }
 
+        const files = Array.from(fileSet);
         for (const file of files) {
             const relPath = normalizeRelPath(this.workspacePath, file);
             const source = inferSourceType(relPath);

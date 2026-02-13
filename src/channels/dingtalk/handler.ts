@@ -60,7 +60,8 @@ import { HumanMessage as LCHumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { withDingTalkConversationContext, consumeQueuedDingTalkReplyFiles } from './context.js';
 import { resolveMemoryScope } from '../../middleware/memory-scope.js';
-import { DingTalkSessionStore, buildStableThreadId } from './session-store.js';
+import { DingTalkSessionStore, createSessionThreadId } from './session-store.js';
+import { buildPromptBootstrapMessage } from '../../prompt/bootstrap.js';
 
 // Session state cache (scopeKey -> SessionState)
 const sessionCache = new Map<string, SessionState>();
@@ -211,7 +212,7 @@ async function getOrCreateSession(params: {
     }
 
     const newSession: SessionState = {
-        threadId: buildStableThreadId(scopeKey),
+        threadId: createSessionThreadId(scopeKey),
         messageHistory: [],
         totalTokens: 0,
         totalInputTokens: 0,
@@ -602,7 +603,7 @@ function normalizeHistoryContent(content: unknown): string {
     }
 }
 
-function toAgentHistoryMessage(message: BaseMessage): { role: 'system' | 'assistant' | 'user'; content: string } | null {
+function toAgentHistoryMessage(message: BaseMessage): { role: 'assistant' | 'user'; content: string } | null {
     const content = normalizeHistoryContent(message.content);
     if (!content) {
         return null;
@@ -610,7 +611,10 @@ function toAgentHistoryMessage(message: BaseMessage): { role: 'system' | 'assist
 
     switch (message._getType()) {
     case 'system':
-        return { role: 'system', content };
+        return {
+            role: 'user',
+            content: `【历史系统上下文转述】\n${content}`,
+        };
     case 'ai':
         return { role: 'assistant', content };
     case 'human':
@@ -623,21 +627,37 @@ function toAgentHistoryMessage(message: BaseMessage): { role: 'system' | 'assist
 function buildAgentInvocationMessages(
     session: SessionState,
     userText: string,
-    options?: { enforceMemorySearch?: boolean; startupMemoryInjection?: string | null },
-): Array<{ role: 'system' | 'assistant' | 'user'; content: string }> {
+    options?: {
+        enforceMemorySearch?: boolean;
+        startupMemoryInjection?: string | null;
+        bootstrapPromptMessage?: { role: 'user'; content: string } | null;
+    },
+): Array<{ role: 'assistant' | 'user'; content: string }> {
+    const bootstrapMessages: Array<{ role: 'user'; content: string }> = [];
+    if (options?.bootstrapPromptMessage) {
+        bootstrapMessages.push(options.bootstrapPromptMessage);
+    }
+
     if (hydratedThreadIds.has(session.threadId)) {
-        return normalizeInvocationMessages(buildDingTalkAgentMessagesWithPolicy(userText, options));
+        return normalizeInvocationMessages([
+            ...bootstrapMessages,
+            ...buildDingTalkAgentMessagesWithPolicy(userText, options),
+        ]);
     }
 
     const history = session.messageHistory
         .map((message) => toAgentHistoryMessage(message))
-        .filter((item): item is { role: 'system' | 'assistant' | 'user'; content: string } => Boolean(item));
+        .filter((item): item is { role: 'assistant' | 'user'; content: string } => Boolean(item));
 
     if (history.length === 0) {
-        return normalizeInvocationMessages(buildDingTalkAgentMessagesWithPolicy(userText, options));
+        return normalizeInvocationMessages([
+            ...bootstrapMessages,
+            ...buildDingTalkAgentMessagesWithPolicy(userText, options),
+        ]);
     }
 
     return normalizeInvocationMessages([
+        ...bootstrapMessages,
         ...history,
         ...buildDingTalkAgentMessagesWithPolicy(userText, options),
     ]);
@@ -645,23 +665,20 @@ function buildAgentInvocationMessages(
 
 function normalizeInvocationMessages(
     messages: Array<{ role: 'system' | 'assistant' | 'user'; content: string }>
-): Array<{ role: 'system' | 'assistant' | 'user'; content: string }> {
+): Array<{ role: 'assistant' | 'user'; content: string }> {
     if (messages.length === 0) {
-        return messages;
+        return [];
     }
 
-    const normalized: Array<{ role: 'system' | 'assistant' | 'user'; content: string }> = [];
-    let hasSystemAtFirst = false;
+    const normalized: Array<{ role: 'assistant' | 'user'; content: string }> = [];
 
     for (const message of messages) {
-        if (message.role !== 'system') {
-            normalized.push(message);
-            continue;
-        }
-
-        if (!hasSystemAtFirst && normalized.length === 0) {
-            normalized.push(message);
-            hasSystemAtFirst = true;
+        if (message.role === 'assistant' || message.role === 'user') {
+            const role: 'assistant' | 'user' = message.role;
+            normalized.push({
+                role,
+                content: message.content,
+            });
             continue;
         }
 
@@ -1950,8 +1967,15 @@ async function handleMessageInternal(
             log.info('[DingTalk] Memory recall intent detected, enforce memory_search preflight');
         }
         const shouldInjectStartupMemory = !hydratedThreadIds.has(session.threadId) && session.messageHistory.length === 0;
+        const shouldInjectBootstrap = !hydratedThreadIds.has(session.threadId);
         const startupMemoryInjection = shouldInjectStartupMemory
             ? await buildSessionStartupMemoryInjection({
+                workspacePath: memoryWorkspacePath,
+                scopeKey: scope.key,
+            })
+            : null;
+        const bootstrapPromptMessage = shouldInjectBootstrap
+            ? await buildPromptBootstrapMessage({
                 workspacePath: memoryWorkspacePath,
                 scopeKey: scope.key,
             })
@@ -1959,9 +1983,13 @@ async function handleMessageInternal(
         if (startupMemoryInjection) {
             log.info(`[DingTalk] Startup memory injection enabled for ${session.threadId}, chars=${startupMemoryInjection.length}`);
         }
+        if (bootstrapPromptMessage) {
+            log.info(`[DingTalk] Prompt bootstrap injected for ${session.threadId}, chars=${bootstrapPromptMessage.content.length}, scope=${scope.key}`);
+        }
         const invocationMessages = buildAgentInvocationMessages(session, content.text, {
             enforceMemorySearch,
             startupMemoryInjection,
+            bootstrapPromptMessage,
         });
         const agentConfig = {
             configurable: { thread_id: session.threadId },

@@ -148,6 +148,12 @@ export function buildStableThreadId(scopeKey: string): string {
     return `dingtalk-${display}-${digest}`;
 }
 
+export function createSessionThreadId(scopeKey: string): string {
+    const stable = buildStableThreadId(scopeKey);
+    const nonce = crypto.randomUUID().slice(0, 8);
+    return `${stable}-${Date.now().toString(36)}-${nonce}`;
+}
+
 export class DingTalkSessionStore {
     private readonly schemaSql: string;
     private readonly tableSql: string;
@@ -219,8 +225,9 @@ export class DingTalkSessionStore {
             return null;
         }
 
+        const persistedThreadId = typeof row.thread_id === 'string' ? row.thread_id.trim() : '';
         return {
-            threadId: row.thread_id,
+            threadId: persistedThreadId || createSessionThreadId(sessionKey),
             messageHistory: deserializeMessages(row.message_history_json),
             totalTokens: Math.max(0, coerceNumber(row.total_tokens, 0)),
             totalInputTokens: Math.max(0, coerceNumber(row.total_input_tokens, 0)),

@@ -35,6 +35,7 @@ import {
     recordSessionTranscript,
     type MemoryFlushState,
 } from './middleware/index.js';
+import { buildPromptBootstrapMessage } from './prompt/bootstrap.js';
 
 // ANSI terminal colors
 const colors = {
@@ -210,6 +211,7 @@ async function main() {
     let totalOutputTokens = 0;
     let hasConversation = false;
     const memoryWorkspacePath = resolve(process.cwd(), config.agent.workspace);
+    const bootstrappedThreads = new Set<string>();
     const appVersion = process.env.npm_package_version || '1.0.0';
 
     const getAgentConfig = () => ({
@@ -511,9 +513,21 @@ async function main() {
                 process.stdout.write(`${colors.white}● ${colors.reset}`);
 
                 let fullResponse = '';
+                const invocationMessages: Array<{ role: 'system' | 'user'; content: string }> = [];
+                if (!bootstrappedThreads.has(threadId)) {
+                    const bootstrapPromptMessage = await buildPromptBootstrapMessage({
+                        workspacePath: memoryWorkspacePath,
+                        scopeKey: 'main',
+                    });
+                    if (bootstrapPromptMessage) {
+                        invocationMessages.push(bootstrapPromptMessage);
+                    }
+                    bootstrappedThreads.add(threadId);
+                }
+                invocationMessages.push({ role: 'user', content: userInput });
 
                 const eventStream = agent.streamEvents(
-                    { messages: [{ role: 'user', content: userInput }] },
+                    { messages: invocationMessages },
                     { ...getAgentConfig(), version: 'v2' }
                 );
 
