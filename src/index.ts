@@ -3,17 +3,15 @@ import { stdin as input, stdout as output } from 'node:process';
 import crypto from 'node:crypto';
 import { resolve } from 'node:path';
 
-import { createAgent } from './agent.js';
 import type { ExecApprovalPrompt, ExecApprovalRequest, ExecApprovalDecision } from './agent.js';
 import { loadConfig } from './config.js';
+import { ConversationRuntime } from './conversation/runtime.js';
 import {
     createChatModel,
     getActiveModelAlias,
     getActiveModelEntry,
     getActiveModelName,
-    hasModelAlias,
     listConfiguredModels,
-    setActiveModelAlias,
 } from './llm.js';
 import {
     estimateTotalTokens,
@@ -35,7 +33,6 @@ import {
     recordSessionTranscript,
     type MemoryFlushState,
 } from './middleware/index.js';
-import { buildPromptBootstrapMessage } from './prompt/bootstrap.js';
 
 // ANSI terminal colors
 const colors = {
@@ -187,12 +184,13 @@ async function main() {
         }
         : undefined;
 
-    const initialAgentContext = await createAgent(config, {
-        execApprovalPrompt,
+    const conversationRuntime = new ConversationRuntime({
+        config,
         runtimeChannel: 'cli',
+        execApprovalPrompt,
     });
-    let agent = initialAgentContext.agent;
-    let cleanup = initialAgentContext.cleanup;
+    await conversationRuntime.initialize();
+    let agent = conversationRuntime.getAgent();
 
     // Create model instance for compaction
     let compactionModel = await createChatModel(config, { temperature: 0 });
@@ -211,7 +209,6 @@ async function main() {
     let totalOutputTokens = 0;
     let hasConversation = false;
     const memoryWorkspacePath = resolve(process.cwd(), config.agent.workspace);
-    const bootstrappedThreads = new Set<string>();
     const appVersion = process.env.npm_package_version || '1.0.0';
 
     const getAgentConfig = () => ({
@@ -256,50 +253,16 @@ async function main() {
         if (!trimmedAlias) {
             return '❌ 模型别名不能为空。';
         }
-        if (!hasModelAlias(config, trimmedAlias)) {
-            return `❌ 未找到模型别名: ${trimmedAlias}`;
-        }
-
-        const previousAlias = getActiveModelAlias(config);
-        if (trimmedAlias === previousAlias) {
+        if (trimmedAlias === getActiveModelAlias(config)) {
             return `ℹ️ 当前已在使用模型: ${trimmedAlias}`;
         }
 
-        let nextCleanup: (() => Promise<void>) | null = null;
         try {
-            setActiveModelAlias(config, trimmedAlias);
-            const nextAgentContext = await createAgent(config, {
-                execApprovalPrompt,
-                runtimeChannel: 'cli',
-            });
-            nextCleanup = nextAgentContext.cleanup;
-            const nextCompactionModel = await createChatModel(config, { temperature: 0 });
-
-            const oldCleanup = cleanup;
-            agent = nextAgentContext.agent;
-            cleanup = nextAgentContext.cleanup;
-            compactionModel = nextCompactionModel;
-
-            try {
-                await oldCleanup();
-            } catch (error) {
-                console.warn(`${colors.yellow}[MCP] previous agent cleanup failed:${colors.reset}`, error instanceof Error ? error.message : String(error));
-            }
-
-            return `✅ 已切换模型: ${trimmedAlias} (${getActiveModelName(config)})`;
+            const switched = await conversationRuntime.switchModel(trimmedAlias);
+            compactionModel = await createChatModel(config, { temperature: 0 });
+            agent = conversationRuntime.getAgent();
+            return `✅ 已切换模型: ${switched.alias} (${switched.model})`;
         } catch (error) {
-            if (nextCleanup) {
-                try {
-                    await nextCleanup();
-                } catch {
-                    // ignore cleanup errors on failed switch
-                }
-            }
-            try {
-                setActiveModelAlias(config, previousAlias);
-            } catch {
-                // ignore rollback failure and report original switch error
-            }
             return `❌ 切换模型失败: ${error instanceof Error ? error.message : String(error)}`;
         }
     }
@@ -409,7 +372,7 @@ async function main() {
         }
 
         try {
-            await cleanup();
+            await conversationRuntime.close();
         } catch (error) {
             console.warn(`${colors.yellow}[MCP] cleanup failed:${colors.reset}`, error instanceof Error ? error.message : String(error));
         }
@@ -514,16 +477,12 @@ async function main() {
 
                 let fullResponse = '';
                 const invocationMessages: Array<{ role: 'system' | 'user'; content: string }> = [];
-                if (!bootstrappedThreads.has(threadId)) {
-                    const bootstrapPromptMessage = await buildPromptBootstrapMessage({
-                        workspacePath: memoryWorkspacePath,
-                        scopeKey: 'main',
-                    });
-                    if (bootstrapPromptMessage) {
-                        invocationMessages.push(bootstrapPromptMessage);
-                    }
-                    bootstrappedThreads.add(threadId);
-                }
+                const bootstrapMessages = await conversationRuntime.buildBootstrapMessages({
+                    threadId,
+                    workspacePath: memoryWorkspacePath,
+                    scopeKey: 'main',
+                });
+                invocationMessages.push(...bootstrapMessages);
                 invocationMessages.push({ role: 'user', content: userInput });
 
                 const eventStream = agent.streamEvents(
