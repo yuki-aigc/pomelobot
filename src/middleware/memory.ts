@@ -18,6 +18,7 @@ export function loadMemoryContext(workspacePath: string): string {
         '当用户询问“你还记得吗/之前/上次/今天/昨天/我们聊过什么”等历史回溯问题时，先调用 memory_search。',
         '当需要精确引用记忆（数字、日期、阈值、原话）时，先 memory_search，再用 memory_get 读取命中片段。',
         '若检索不足，请明确说明“已检索但信息不足”，不要臆造记忆。',
+        '当用户纠正你、或你发现自己有可复盘错误时，调用 heartbeat_save 记录“触发场景/纠正动作/防回归要点”。',
     ].join('\n');
 }
 
@@ -91,7 +92,7 @@ export function createMemoryTools(workspacePath: string, config: Config) {
         },
         {
             name: 'memory_get',
-            description: '按 path 精读记忆片段（建议先 memory_search）。支持 MEMORY.md / memory/**/*.md / session_events 路径，可选 from/lines。',
+            description: '按 path 精读记忆片段（建议先 memory_search）。支持 MEMORY.md / HEARTBEAT.md / memory/**/*.md / session_events 路径，可选 from/lines。',
             schema: z.object({
                 path: z.string().describe('要读取的记忆路径，建议直接使用 memory_search 返回的 path'),
                 from: z.number().int().min(1).optional().describe('起始行号（从 1 开始），默认 1'),
@@ -100,7 +101,24 @@ export function createMemoryTools(workspacePath: string, config: Config) {
         }
     );
 
-    return [memorySave, memorySearch, memoryGet];
+    const heartbeatSave = tool(
+        async ({ content, category }: { content: string; category?: string }) => {
+            const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+            const runtime = await runtimePromise;
+            const result = await runtime.saveHeartbeat(content, scope, category);
+            return `已保存到 HEARTBEAT: ${result.path} (scope=${result.scope})`;
+        },
+        {
+            name: 'heartbeat_save',
+            description: '保存纠错复盘与行为改进要点到 HEARTBEAT.md（按会话 scope 隔离）。建议内容包含触发场景、纠正动作、防回归检查。',
+            schema: z.object({
+                content: z.string().describe('要记录的纠错/复盘内容'),
+                category: z.string().optional().describe('分类标签，例如 incident/process/style/safety'),
+            }),
+        }
+    );
+
+    return [memorySave, memorySearch, memoryGet, heartbeatSave];
 }
 
 export async function recordSessionTranscript(

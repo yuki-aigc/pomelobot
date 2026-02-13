@@ -27,7 +27,7 @@ RUN usermod -g 0 -s /bin/bash ubuntu && \
 USER ubuntu
 
 ENV NPM_CONFIG_PREFIX=/home/ubuntu/.npm-global
-ENV PATH=/home/ubuntu/.npm-global/bin:$PATH
+ENV PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:$PATH
 ENV HOME=/home/ubuntu
 
 # 安装pnpm，claude code,  uvx等

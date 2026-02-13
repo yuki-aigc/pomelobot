@@ -26,6 +26,7 @@
 | ⚡ **会话向量召回** | `dingtalk_session_events` 向量异步回填 + PG 内 ANN 检索，失败自动回退 FTS / temporal |
 | ♻️ **会话TTL治理** | `dingtalk_session_events` 支持按 TTL 自动清理，控制历史体量与检索成本 |
 | 🧹 **上下文压缩** | 自动 / 手动压缩对话历史，实时展示 Token 使用情况 |
+| 🧭 **Prompt Bootstrap** | 支持 OpenClaw 风格 `AGENTS/TOOLS/SOUL/HEARTBEAT` 多文件注入，含规则优先级与 scope 覆盖 |
 | 🛠️ **技能系统** | 以 `SKILL.md` 定义技能，动态加载并通过子代理协作 |
 | 🔌 **MCP 集成** | 通过 `@langchain/mcp-adapters` 挂载 MCP 工具（stdio / http / sse） |
 | 🤖 **多模型支持** | OpenAI / Anthropic（多模型配置池，运行时 `/model` 热切换） |
@@ -164,6 +165,10 @@ pomelobot/
 │           └── types.ts         # iOS 消息协议类型
 ├── workspace/
 │   ├── MEMORY.md                # 长期记忆
+│   ├── AGENTS.md                # 项目级执行规范（Prompt Bootstrap）
+│   ├── TOOLS.md                 # 工具使用约定（Prompt Bootstrap）
+│   ├── SOUL.md                  # 角色与风格定义（Prompt Bootstrap）
+│   ├── HEARTBEAT.md             # 纠错与复盘经验（Prompt Bootstrap）
 │   ├── memory/                  # 每日记忆目录
 │   ├── skills/                  # 技能目录（每个技能含 SKILL.md）
 │   └── cron/                    # 定时任务存储与运行日志
@@ -235,7 +240,7 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
   "agent": {
     "workspace": "./workspace",           // 工作区根目录
     "skills_dir": "./workspace/skills",   // 技能目录
-    "recursion_limit": 50,                // LangGraph 递归上限（防止无限循环）
+    "recursion_limit": 100,                // LangGraph 递归上限（防止无限循环）
     "compaction": {
       "enabled": true,                  // 是否开启上下文压缩
       "auto_compact_threshold": 80000,  // 自动压缩阈值（tokens）
@@ -298,6 +303,24 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 }
 ```
 
+### Prompt Bootstrap（AGENTS / TOOLS / SOUL / HEARTBEAT）
+
+- 全局项目规范文件：`workspace/AGENTS.md`
+- 全局工具约定文件：`workspace/TOOLS.md`
+- 全局角色文件：`workspace/SOUL.md`
+- 全局纠错复盘文件：`workspace/HEARTBEAT.md`
+- scope 级覆盖：`workspace/memory/scopes/<scope>/{TOOLS.md,SOUL.md,HEARTBEAT.md}`（存在时优先）
+
+系统在每个会话 thread 首次调用时注入引导文件（默认常开、无需配置），并按以下优先级处理冲突：
+
+1. 平台与运行时硬约束（审批、安全策略、工具白/黑名单）
+2. 系统提示词硬规则
+3. 用户当前任务目标与明确约束
+4. `AGENTS.md`
+5. `TOOLS.md`
+6. `SOUL.md`（scope 覆盖优先）
+7. `HEARTBEAT.md`（scope 覆盖优先）
+
 ### 命令执行
 
 ```jsonc
@@ -336,6 +359,7 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
                 "transport": "stdio",
                 "command": "npx",
                 "args": ["-y", "@modelcontextprotocol/server-filesystem", "${MCP_FS_ROOT}"],
+                "stderr": "inherit",              // inherit | pipe | ignore | overlapped
                 "env": { "MCP_FS_ROOT": "./workspace" }
             },
             "weather": {                          // SSE 模式
@@ -352,6 +376,7 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 > - `transport` 支持 `stdio`、`http`、`sse` 三种模式
 > - 每个 `mcp.servers.<name>` 都支持 `env`，并可在同一 server 的字符串字段里使用 `${VAR}` 占位符
+> - `stdio` server 可配置 `stderr`：若手动 `Ctrl+C` 时出现三方 MCP 子进程 traceback，可设为 `ignore` 降噪
 > - MCP 工具会自动注入主 Agent 工具列表，CLI / DingTalk / iOS 模式均可使用
 
 ### 定时任务
