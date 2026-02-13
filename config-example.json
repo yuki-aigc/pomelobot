@@ -113,6 +113,7 @@
                     "@modelcontextprotocol/server-filesystem",
                     "${MCP_FS_ROOT}"
                 ],
+                "stderr": "inherit",
                 "env": {
                     "MCP_FS_ROOT": "./workspace"
                 },

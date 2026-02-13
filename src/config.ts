@@ -568,7 +568,9 @@ export function loadConfig(): Config {
         },
         agent: {
             ...DEFAULT_CONFIG.agent,
-            ...fileConfig.agent,
+            workspace: fileConfig.agent?.workspace ?? DEFAULT_CONFIG.agent.workspace,
+            skills_dir: fileConfig.agent?.skills_dir ?? DEFAULT_CONFIG.agent.skills_dir,
+            recursion_limit: fileConfig.agent?.recursion_limit ?? DEFAULT_CONFIG.agent.recursion_limit,
             compaction: {
                 ...DEFAULT_CONFIG.agent.compaction,
                 ...(fileConfig.agent?.compaction || {}),

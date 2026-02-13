@@ -10,6 +10,7 @@
 import { DWClient, TOPIC_CARD, TOPIC_ROBOT } from 'dingtalk-stream';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 import { createAgent } from './agent.js';
 import type { ExecApprovalRequest } from './agent.js';
 import { loadConfig } from './config.js';
@@ -36,6 +37,7 @@ import { setCronService } from './cron/runtime.js';
 import { resolveCronStorePath } from './cron/store.js';
 import type { CronJob } from './cron/types.js';
 import type { RuntimeLogWriter } from './log/runtime.js';
+import { buildPromptBootstrapMessage } from './prompt/bootstrap.js';
 
 // ANSI terminal colors
 const colors = {
@@ -350,6 +352,7 @@ export async function startDingTalkService(options?: {
     }
 
     const dingtalkConfig = config.dingtalk;
+    const memoryWorkspacePath = resolve(process.cwd(), config.agent.workspace);
 
     if (!dingtalkConfig.clientId || !dingtalkConfig.clientSecret) {
         throw new Error('DingTalk clientId and clientSecret are required');
@@ -488,14 +491,21 @@ export async function startDingTalkService(options?: {
             }
 
             const threadId = `cron-${job.id}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+            const cronMessages: Array<{ role: 'user'; content: string }> = [];
+            const bootstrapPromptMessage = await buildPromptBootstrapMessage({
+                workspacePath: memoryWorkspacePath,
+                scopeKey: 'main',
+            });
+            if (bootstrapPromptMessage) {
+                cronMessages.push(bootstrapPromptMessage);
+            }
+            cronMessages.push({
+                role: 'user',
+                content: `[定时任务 ${job.name}] ${job.payload.message}`,
+            });
             const invokeResult = await currentAgent.invoke(
                 {
-                    messages: [
-                        {
-                            role: 'user',
-                            content: `[定时任务 ${job.name}] ${job.payload.message}`,
-                        },
-                    ],
+                    messages: cronMessages,
                 },
                 {
                     configurable: { thread_id: threadId },
