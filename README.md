@@ -233,6 +233,24 @@ export OPENAI_MODEL="gpt-4o"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
+敏感配置推荐放在 `~/.pomelobot/credentials/.env`（可通过 `POMELOBOT_CREDENTIALS_ENV_PATH` 自定义路径），格式示例：
+
+```bash
+OPENAI_API_KEY="sk-xxx"
+ANTHROPIC_API_KEY="sk-ant-xxx"
+MEMORY_PG_PASSWORD="xxx"
+```
+
+读取优先级：
+
+1. `config.json` 中已配置的值（优先）
+2. 进程环境变量 / `~/.pomelobot/credentials/.env` 作为兜底
+
+说明：
+
+- Skills / Tools 执行前会临时注入 `credentials/.env` 变量，执行结束后自动恢复。
+- 审计日志会对 `api_key/token/password/secret` 等敏感字段自动脱敏。
+
 ### Agent 核心配置
 
 ```jsonc

@@ -18,3 +18,7 @@ workspace/cron/*
 workspace/tmp/*
 # Qwen Code目录
 .qwen/config/settings.json
+
+
+# SKILLS部分目录
+workspace/skills/cloud-resource-bill

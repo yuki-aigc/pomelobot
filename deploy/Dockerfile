@@ -13,7 +13,8 @@ RUN sed -i 's@//archive.ubuntu.com@//mirrors.aliyun.com@g' /etc/apt/sources.list
 # Keep original preinstalled toolset
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl ca-certificates git vim python3 python3-pip python3-venv && \
+        curl ca-certificates git vim python3 python3-pip python3-venv \
+        default-mysql-client && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \

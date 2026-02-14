@@ -16,6 +16,7 @@ import {
 } from './types.js';
 import { DEFAULT_COMMANDS, DEFAULT_CONFIG } from './defaults.js';
 import { validateConfig } from './schema.js';
+import { readEnvWithCredentialFallback } from '../security/credential-env.js';
 
 /**
  * Load exec commands from a separate file or use inline config
@@ -141,67 +142,78 @@ function pushModel(list: LLMModelConfig[], model: LLMModelConfig): void {
     }
 }
 
-function applyProviderEnvOverrides(config: Config): void {
-    if (process.env.OPENAI_MODEL) {
-        config.llm.models = config.llm.models.map((item) =>
-            item.provider === 'openai' ? { ...item, model: process.env.OPENAI_MODEL! } : item
-        );
-    }
-    if (process.env.OPENAI_BASE_URL) {
-        config.llm.models = config.llm.models.map((item) =>
-            item.provider === 'openai' ? { ...item, base_url: process.env.OPENAI_BASE_URL! } : item
-        );
-    }
-    if (process.env.OPENAI_API_KEY) {
-        config.llm.models = config.llm.models.map((item) =>
-            item.provider === 'openai' ? { ...item, api_key: process.env.OPENAI_API_KEY! } : item
-        );
-    }
-    if (process.env.ANTHROPIC_MODEL) {
-        config.llm.models = config.llm.models.map((item) =>
-            item.provider === 'anthropic' ? { ...item, model: process.env.ANTHROPIC_MODEL! } : item
-        );
-    }
-    if (process.env.ANTHROPIC_BASE_URL) {
-        config.llm.models = config.llm.models.map((item) =>
-            item.provider === 'anthropic' ? { ...item, base_url: process.env.ANTHROPIC_BASE_URL! } : item
-        );
-    }
-    if (process.env.ANTHROPIC_API_KEY) {
-        config.llm.models = config.llm.models.map((item) =>
-            item.provider === 'anthropic' ? { ...item, api_key: process.env.ANTHROPIC_API_KEY! } : item
-        );
-    }
+function hasText(value: string | undefined): boolean {
+    return typeof value === 'string' && value.trim().length > 0;
 }
 
-function applyMemoryEnvOverrides(config: Config): void {
-    if (process.env.MEMORY_BACKEND) {
-        const backend = process.env.MEMORY_BACKEND.trim().toLowerCase();
-        if (backend === 'filesystem' || backend === 'pgsql') {
-            config.agent.memory.backend = backend;
+function applyProviderEnvFallbacks(config: Config): void {
+    const openaiModel = readEnvWithCredentialFallback('OPENAI_MODEL');
+    const openaiBaseUrl = readEnvWithCredentialFallback('OPENAI_BASE_URL');
+    const openaiApiKey = readEnvWithCredentialFallback('OPENAI_API_KEY');
+    const anthropicModel = readEnvWithCredentialFallback('ANTHROPIC_MODEL');
+    const anthropicBaseUrl = readEnvWithCredentialFallback('ANTHROPIC_BASE_URL');
+    const anthropicApiKey = readEnvWithCredentialFallback('ANTHROPIC_API_KEY');
+
+    config.llm.models = config.llm.models.map((item) => {
+        if (item.provider === 'openai') {
+            return {
+                ...item,
+                model: hasText(item.model) ? item.model : (openaiModel ?? item.model),
+                base_url: hasText(item.base_url) ? item.base_url : (openaiBaseUrl ?? item.base_url),
+                api_key: hasText(item.api_key) ? item.api_key : (openaiApiKey ?? item.api_key),
+            };
         }
-    }
-    if (process.env.MEMORY_PG_CONNECTION_STRING) {
-        config.agent.memory.pgsql.connection_string = process.env.MEMORY_PG_CONNECTION_STRING;
+
+        if (item.provider === 'anthropic') {
+            return {
+                ...item,
+                model: hasText(item.model) ? item.model : (anthropicModel ?? item.model),
+                base_url: hasText(item.base_url) ? item.base_url : (anthropicBaseUrl ?? item.base_url),
+                api_key: hasText(item.api_key) ? item.api_key : (anthropicApiKey ?? item.api_key),
+            };
+        }
+
+        return item;
+    });
+}
+
+function applyMemoryEnvFallbacks(config: Config): void {
+    const memoryPgConnectionString = readEnvWithCredentialFallback('MEMORY_PG_CONNECTION_STRING');
+    const memoryPgHost = readEnvWithCredentialFallback('MEMORY_PG_HOST');
+    const memoryPgPort = readEnvWithCredentialFallback('MEMORY_PG_PORT');
+    const memoryPgUser = readEnvWithCredentialFallback('MEMORY_PG_USER');
+    const memoryPgPassword = readEnvWithCredentialFallback('MEMORY_PG_PASSWORD');
+    const memoryPgDatabase = readEnvWithCredentialFallback('MEMORY_PG_DATABASE');
+
+    if (!hasText(config.agent.memory.pgsql.connection_string) && hasText(memoryPgConnectionString)) {
+        config.agent.memory.pgsql.connection_string = memoryPgConnectionString;
         config.agent.memory.pgsql.enabled = true;
     }
-    if (process.env.MEMORY_PG_HOST) {
-        config.agent.memory.pgsql.host = process.env.MEMORY_PG_HOST;
+
+    if (!hasText(config.agent.memory.pgsql.host) && hasText(memoryPgHost)) {
+        config.agent.memory.pgsql.host = memoryPgHost;
     }
-    if (process.env.MEMORY_PG_PORT) {
-        const port = Number(process.env.MEMORY_PG_PORT);
+
+    if (hasText(memoryPgPort)) {
+        const port = Number(memoryPgPort);
         if (Number.isFinite(port) && port > 0) {
-            config.agent.memory.pgsql.port = Math.floor(port);
+            const shouldApplyPort = config.agent.memory.pgsql.port === DEFAULT_CONFIG.agent.memory.pgsql.port;
+            if (shouldApplyPort) {
+                config.agent.memory.pgsql.port = Math.floor(port);
+            }
         }
     }
-    if (process.env.MEMORY_PG_USER) {
-        config.agent.memory.pgsql.user = process.env.MEMORY_PG_USER;
+
+    if (!hasText(config.agent.memory.pgsql.user) && hasText(memoryPgUser)) {
+        config.agent.memory.pgsql.user = memoryPgUser;
     }
-    if (process.env.MEMORY_PG_PASSWORD) {
-        config.agent.memory.pgsql.password = process.env.MEMORY_PG_PASSWORD;
+
+    if (!hasText(config.agent.memory.pgsql.password) && hasText(memoryPgPassword)) {
+        config.agent.memory.pgsql.password = memoryPgPassword;
     }
-    if (process.env.MEMORY_PG_DATABASE) {
-        config.agent.memory.pgsql.database = process.env.MEMORY_PG_DATABASE;
+
+    if (!hasText(config.agent.memory.pgsql.database) && hasText(memoryPgDatabase)) {
+        config.agent.memory.pgsql.database = memoryPgDatabase;
     }
 }
 
@@ -271,16 +283,20 @@ function resolveActiveAlias(config: Config): void {
     }
     config.llm.default_model = defaultAlias;
 
-    let activeAlias = (process.env.LLM_MODEL_ALIAS || '').trim();
-    if (!activeAlias && process.env.LLM_PROVIDER) {
-        const preferredProvider = process.env.LLM_PROVIDER.toLowerCase();
+    let activeAlias = (config.llm.active_model_alias || '').trim();
+    if (!activeAlias) {
+        activeAlias = (readEnvWithCredentialFallback('LLM_MODEL_ALIAS') || '').trim();
+    }
+    const envProvider = readEnvWithCredentialFallback('LLM_PROVIDER');
+    if (!activeAlias && envProvider) {
+        const preferredProvider = envProvider.toLowerCase();
         if (preferredProvider === 'openai' || preferredProvider === 'anthropic') {
             const matched = config.llm.models.find((item) => item.provider === preferredProvider);
             if (matched) {
                 activeAlias = matched.alias;
             }
         } else {
-            console.warn(`Warning: Invalid LLM_PROVIDER=${process.env.LLM_PROVIDER}, ignored`);
+            console.warn(`Warning: Invalid LLM_PROVIDER=${envProvider}, ignored`);
         }
     }
     if (!activeAlias) {
@@ -469,8 +485,8 @@ export function loadConfig(): Config {
         config.llm.models = parsedModels;
     }
 
-    applyProviderEnvOverrides(config);
-    applyMemoryEnvOverrides(config);
+    applyProviderEnvFallbacks(config);
+    applyMemoryEnvFallbacks(config);
 
     if (config.llm.models.length === 0) {
         console.error('Error: No available model configuration found in llm.models');

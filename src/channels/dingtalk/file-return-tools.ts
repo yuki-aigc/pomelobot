@@ -3,6 +3,9 @@ import path from 'node:path';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { getDingTalkConversationContext, queueDingTalkReplyFile } from './context.js';
+import { sendTemplateCard } from './client.js';
+import type { Logger } from './types.js';
+import type { DingTalkConfig } from '../../config.js';
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
@@ -34,7 +37,63 @@ function sanitizeFileName(fileName: string): string {
         .slice(0, 120) || `reply-${Date.now()}.txt`;
 }
 
-export function createDingTalkFileReturnTools(workspaceRoot: string) {
+function resolveTemplateId(override?: string): string {
+    const fromArgs = override?.trim();
+    if (fromArgs) return fromArgs;
+    const fromEnv = process.env.DINGTALK_BILL_CARD_TEMPLATE_ID?.trim();
+    if (fromEnv) return fromEnv;
+    throw new Error('缺少卡片模板 ID，请传入 templateId 或配置 DINGTALK_BILL_CARD_TEMPLATE_ID');
+}
+
+function asCardParamMap(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('cardParamMap 必须是 JSON 对象');
+    }
+    return value as Record<string, unknown>;
+}
+
+async function loadCardParamMapFromFile(workspaceRoot: string, rawPath: string): Promise<Record<string, unknown>> {
+    const resolved = resolvePathFromWorkspace(workspaceRoot, rawPath);
+    const content = await fsPromises.readFile(resolved, 'utf8');
+    return asCardParamMap(JSON.parse(content));
+}
+
+type SendCardArgs = {
+    templateId?: string;
+    cardParamMap?: Record<string, unknown>;
+    cardParamMapPath?: string;
+};
+
+function asSendCardArgs(value: unknown): SendCardArgs {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('argsPath 内容必须是 JSON 对象');
+    }
+    const obj = value as Record<string, unknown>;
+    const templateId = typeof obj.templateId === 'string' ? obj.templateId : undefined;
+    const cardParamMapPath = typeof obj.cardParamMapPath === 'string' ? obj.cardParamMapPath : undefined;
+    const rawCardParamMap = obj.cardParamMap;
+    const cardParamMap = rawCardParamMap == null ? undefined : asCardParamMap(rawCardParamMap);
+    if (!cardParamMapPath && !cardParamMap) {
+        throw new Error('argsPath 中至少包含 cardParamMapPath 或 cardParamMap');
+    }
+    return {
+        templateId,
+        cardParamMap,
+        cardParamMapPath,
+    };
+}
+
+async function loadSendCardArgsFromFile(workspaceRoot: string, rawPath: string): Promise<SendCardArgs> {
+    const resolved = resolvePathFromWorkspace(workspaceRoot, rawPath);
+    const content = await fsPromises.readFile(resolved, 'utf8');
+    return asSendCardArgs(JSON.parse(content));
+}
+
+export function createDingTalkFileReturnTools(
+    workspaceRoot: string,
+    dingtalkConfig?: DingTalkConfig,
+    log?: Logger
+) {
     const workspaceTmpRoot = path.resolve(workspaceRoot, 'tmp');
 
     const dingtalkWriteTmpFile = tool(
@@ -111,5 +170,64 @@ export function createDingTalkFileReturnTools(workspaceRoot: string) {
         }
     );
 
-    return [dingtalkWriteTmpFile, dingtalkSendFile];
+    const dingtalkSendCard = tool(
+        async ({
+            templateId,
+            cardParamMap,
+            cardParamMapPath,
+            argsPath,
+        }: {
+            templateId?: string;
+            cardParamMap?: Record<string, unknown>;
+            cardParamMapPath?: string;
+            argsPath?: string;
+        }) => {
+            const context = getDingTalkConversationContext();
+            if (!context) {
+                return '❌ 当前不是 DingTalk 会话，无法使用 dingtalk_send_card。';
+            }
+            if (!dingtalkConfig?.clientId || !dingtalkConfig?.clientSecret) {
+                return '❌ dingtalk.clientId/clientSecret 未配置，无法发送卡片。';
+            }
+
+            try {
+                const argsFile = argsPath ? await loadSendCardArgsFromFile(workspaceRoot, argsPath) : undefined;
+                const finalTemplateId = resolveTemplateId(templateId || argsFile?.templateId);
+
+                const finalCardParamMapPath = cardParamMapPath || argsFile?.cardParamMapPath;
+                const finalCardParamMapValue = cardParamMap ?? argsFile?.cardParamMap;
+                const finalCardParamMap = finalCardParamMapPath
+                    ? await loadCardParamMapFromFile(workspaceRoot, finalCardParamMapPath)
+                    : asCardParamMap(finalCardParamMapValue);
+
+                const result = await sendTemplateCard(
+                    dingtalkConfig,
+                    context.conversationId,
+                    context.isDirect,
+                    context.senderId,
+                    finalTemplateId,
+                    finalCardParamMap,
+                    log,
+                );
+                return `✅ 卡片已发送，cardInstanceId=${result.cardInstanceId}`;
+            } catch (error) {
+                log?.error?.(`[DingTalk][AICard] dingtalk_send_card failed: ${error instanceof Error ? error.message : String(error)}`);
+                return `❌ 发送卡片失败: ${error instanceof Error ? error.message : String(error)}`;
+            }
+        },
+        {
+            name: 'dingtalk_send_card',
+            description: '在当前 DingTalk 会话发送模板卡片（自动路由到当前用户或当前群）。',
+            schema: z.object({
+                templateId: z.string().optional().describe('卡片模板 ID。可选，未传时读取 DINGTALK_BILL_CARD_TEMPLATE_ID。'),
+                cardParamMap: z.record(z.any()).optional().describe('卡片字段映射（JSON 对象）。'),
+                cardParamMapPath: z.string().optional().describe('卡片字段映射 JSON 文件路径（可替代 cardParamMap）。'),
+                argsPath: z.string().optional().describe('发送参数文件路径（JSON，支持 templateId/cardParamMap/cardParamMapPath）。'),
+            }).refine((value) => Boolean(value.cardParamMap || value.cardParamMapPath || value.argsPath), {
+                message: 'cardParamMap、cardParamMapPath、argsPath 至少提供一个',
+            }),
+        }
+    );
+
+    return [dingtalkWriteTmpFile, dingtalkSendFile, dingtalkSendCard];
 }

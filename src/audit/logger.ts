@@ -1,5 +1,6 @@
 import { appendFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { redactSensitiveData } from '../security/redaction.js';
 
 export type ExecAuditEventType =
     | 'policy_denied'
@@ -25,6 +26,7 @@ function getAuditFilePath(date = new Date()): string {
 
 export async function writeExecAuditEvent(event: ExecAuditEvent): Promise<void> {
     const filePath = getAuditFilePath(new Date(event.timestamp));
+    const redactedEvent = redactSensitiveData(event) as ExecAuditEvent;
     await mkdir(join(process.cwd(), 'logs'), { recursive: true });
-    await appendFile(filePath, `${JSON.stringify(event)}\n`, 'utf-8');
+    await appendFile(filePath, `${JSON.stringify(redactedEvent)}\n`, 'utf-8');
 }
