@@ -18,6 +18,12 @@ import { initializeMCPTools } from './mcp.js';
 import { createChatModel } from './llm.js';
 import { createCronTools } from './cron/tools.js';
 import { createDingTalkFileReturnTools } from './channels/dingtalk/file-return-tools.js';
+import {
+    buildEnvWithCredentialFallback,
+    enterTemporaryCredentialEnv,
+    withTemporaryCredentialEnv,
+} from './security/credential-env.js';
+import { redactSensitiveText } from './security/redaction.js';
 
 // Define return type to avoid complex type inference issues
 export interface RuntimeAgentInvokeResult {
@@ -152,7 +158,7 @@ function formatApprovalMeta(metadata?: ExecApprovalMetadata, comment?: string): 
         );
     }
     if (comment) {
-        lines.push(`  comment=${comment}`);
+        lines.push(`  comment=${redactSensitiveText(comment)}`);
     }
     return lines.join('\n');
 }
@@ -161,7 +167,7 @@ function formatExecAudit(metadata: ExecAuditMetadata, approval?: ExecApprovalDec
     const lines = [
         '🧾 Exec 审计',
         `- callId: ${metadata.callId}`,
-        `- command: ${metadata.command}`,
+        `- command: ${redactSensitiveText(metadata.command)}`,
         `- baseCommand: ${metadata.baseCommand || 'n/a'}`,
         `- cwd: ${metadata.cwd}`,
         `- shell: ${String(metadata.shell)}`,
@@ -180,6 +186,24 @@ function formatExecAudit(metadata: ExecAuditMetadata, approval?: ExecApprovalDec
         lines.push(approvalMeta);
     }
     return lines.join('\n');
+}
+
+function wrapAgentWithCredentialEnv(agent: RuntimeAgent): RuntimeAgent {
+    return {
+        invoke: (input: unknown, options?: unknown) =>
+            withTemporaryCredentialEnv(() => agent.invoke(input, options)),
+        streamEvents: (input: unknown, options?: unknown) =>
+            (async function* streamWithCredentialEnv() {
+                const release = await enterTemporaryCredentialEnv();
+                try {
+                    for await (const event of agent.streamEvents(input, options)) {
+                        yield event;
+                    }
+                } finally {
+                    release();
+                }
+            })(),
+    };
 }
 
 /**
@@ -305,11 +329,12 @@ function createExecTool(config: Config, execApprovalPrompt?: ExecApprovalPrompt)
                 }
             }
 
-            console.log(`[ExecTool] [${callId}] Executing command: ${finalCommand}`);
+            console.log(`[ExecTool] [${callId}] Executing command: ${redactSensitiveText(finalCommand)}`);
 
             const result = await runCommand(finalCommand, execConfig, {
                 cwd: finalCwd,
                 timeoutMs: finalTimeout,
+                env: buildEnvWithCredentialFallback(),
                 policyMode: policy.status === 'unknown' ? 'deny-only' : 'enforce',
                 callId,
             });
@@ -405,7 +430,17 @@ export async function createSREAgent(
     const mcpBootstrap = await initializeMCPTools(cfg);
     const mcpTools = mcpBootstrap.tools;
     const cronTools = createCronTools(cfg);
-    const dingtalkFileTools = enableDingTalkTools ? createDingTalkFileReturnTools(workspacePath) : [];
+    const dingtalkToolLogger = enableDingTalkTools
+        ? {
+            debug: (message: string, ...args: unknown[]) => console.debug(message, ...args),
+            info: (message: string, ...args: unknown[]) => console.info(message, ...args),
+            warn: (message: string, ...args: unknown[]) => console.warn(message, ...args),
+            error: (message: string, ...args: unknown[]) => console.error(message, ...args),
+        }
+        : undefined;
+    const dingtalkFileTools = enableDingTalkTools
+        ? createDingTalkFileReturnTools(workspacePath, cfg.dingtalk, dingtalkToolLogger)
+        : [];
 
     // Combine all tools
     const allTools = [...memoryTools, execTool, ...cronTools, ...dingtalkFileTools, ...mcpTools];
@@ -507,7 +542,7 @@ ${mcpServersHint}`;
     // Create the agent with FilesystemBackend and memory tools
     let agent: RuntimeAgent;
     try {
-        const createdAgent = await createDeepAgent({
+        const createdAgent = await withTemporaryCredentialEnv(() => createDeepAgent({
             model,
             systemPrompt,
             tools: allTools,
@@ -515,8 +550,8 @@ ${mcpServersHint}`;
             backend: () => new FilesystemBackend({ rootDir: workspacePath }),
             skills: [skillsPath],
             checkpointer,
-        });
-        agent = createdAgent as unknown as RuntimeAgent;
+        }));
+        agent = wrapAgentWithCredentialEnv(createdAgent as unknown as RuntimeAgent);
     } catch (error) {
         await mcpBootstrap.close();
         throw error;

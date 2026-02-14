@@ -1,6 +1,7 @@
 import { MultiServerMCPClient, type ClientConfig } from '@langchain/mcp-adapters';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type { Config, MCPConfig, MCPServerConfig } from './config.js';
+import { buildEnvWithCredentialFallback } from './security/credential-env.js';
 
 type MCPBootstrapResult = {
     tools: DynamicStructuredTool[];
@@ -44,8 +45,9 @@ function resolveServerHeaders(
 
 function getServerConnectionConfig(serverName: string, server: MCPServerConfig): Record<string, unknown> {
     const scopedEnv = normalizeServerEnv(serverName, server.env);
+    const processEnvWithCredentials = buildEnvWithCredentialFallback(process.env);
     const effectiveEnv: Record<string, string | undefined> = {
-        ...process.env,
+        ...processEnvWithCredentials,
         ...(scopedEnv ?? {}),
     };
 

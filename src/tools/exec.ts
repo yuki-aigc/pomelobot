@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import type { ExecConfig } from '../config.js';
 import { checkCommandPolicy } from './exec-policy.js';
 import { parseCommandInput } from './command-parser.js';
@@ -54,6 +56,47 @@ interface OutputBufferState {
     truncated: boolean;
 }
 
+function expandTildePath(value: string): string {
+    if (value === '~') {
+        return homedir();
+    }
+    if (value.startsWith('~/')) {
+        return path.join(homedir(), value.slice(2));
+    }
+    return value;
+}
+
+function expandLeadingEnvPath(value: string, env: NodeJS.ProcessEnv): string {
+    const match = value.match(/^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))(.*)$/);
+    if (!match) {
+        return value;
+    }
+
+    const envName = (match[1] || match[2] || '').trim();
+    const rest = match[3] || '';
+    if (!envName) {
+        return value;
+    }
+
+    // Only expand path-like tokens (`$HOME`, `$HOME/...`, `${HOME}/...`) to avoid
+    // breaking command fragments like awk `$1`.
+    if (rest && !rest.startsWith('/')) {
+        return value;
+    }
+
+    const envValue = env[envName];
+    if (!envValue) {
+        return value;
+    }
+
+    return `${envValue}${rest}`;
+}
+
+function expandCommandToken(value: string, env: NodeJS.ProcessEnv): string {
+    const envExpanded = expandLeadingEnvPath(value, env);
+    return expandTildePath(envExpanded);
+}
+
 /**
  * Append output chunk while capping in-memory buffer size.
  */
@@ -106,7 +149,8 @@ export async function runCommand(
     const callId = options.callId || `call_${randomUUID().slice(0, 8)}`;
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
-    const finalCwd = options.cwd || process.cwd();
+    const runtimeEnv = options.env ? { ...process.env, ...options.env } : process.env;
+    const finalCwd = options.cwd ? expandCommandToken(options.cwd, runtimeEnv) : process.cwd();
 
     const parsed = parseCommandInput(commandStr);
     const policyMode = options.policyMode ?? 'enforce';
@@ -193,8 +237,8 @@ export async function runCommand(
         }
     }
 
-    const command = parsed.parsed.command;
-    const args = parsed.parsed.args;
+    const command = expandCommandToken(parsed.parsed.command, runtimeEnv);
+    const args = parsed.parsed.args.map((arg) => expandCommandToken(arg, runtimeEnv));
 
     return new Promise((resolve) => {
         const stdoutState: OutputBufferState = { text: '', totalLength: 0, truncated: false };
@@ -204,7 +248,7 @@ export async function runCommand(
 
         const child = spawn(command, args, {
             cwd: finalCwd,
-            env: options.env ? { ...process.env, ...options.env } : process.env,
+            env: runtimeEnv,
             shell: false,
         });
         const childPid = child.pid ?? null;

@@ -45,6 +45,71 @@ function getTargetKey(conversationId: string, isDirect: boolean, userId?: string
     return isDirect ? (userId || conversationId) : conversationId;
 }
 
+function resolveCardDeliveryTarget(
+    config: DingTalkConfig,
+    conversationId: string,
+    isDirect: boolean,
+    userId: string | undefined
+): Record<string, unknown> {
+    const isGroup = !isDirect;
+    const targetUserId = userId || conversationId;
+    const robotCode = config.robotCode || config.clientId;
+
+    if (isGroup) {
+        return {
+            openSpaceId: `dtv1.card//IM_GROUP.${conversationId}`,
+            userIdType: 1,
+            imGroupOpenSpaceModel: { supportForward: true },
+            imGroupOpenDeliverModel: { robotCode },
+        };
+    }
+
+    const directTarget: Record<string, unknown> = {
+        openSpaceId: `dtv1.card//IM_ROBOT.${targetUserId}`,
+        userIdType: 1,
+        imRobotOpenSpaceModel: { supportForward: true },
+        imRobotOpenDeliverModel: {
+            spaceType: 'IM_ROBOT',
+            robotCode,
+        },
+    };
+    if (userId) {
+        directTarget.userId = userId;
+    }
+    return directTarget;
+}
+
+function extractCreateAndDeliverError(data: unknown): string | null {
+    if (!data || typeof data !== 'object') {
+        return null;
+    }
+
+    const payload = data as Record<string, unknown>;
+    const errCode = payload.errcode ?? payload.errCode;
+    if (typeof errCode === 'number' && errCode !== 0) {
+        return String(payload.errmsg ?? payload.errorMsg ?? payload.message ?? `errCode=${errCode}`);
+    }
+    if (typeof errCode === 'string' && errCode.trim() !== '' && errCode !== '0') {
+        return String(payload.errmsg ?? payload.errorMsg ?? payload.message ?? `errCode=${errCode}`);
+    }
+
+    if (payload.success === false) {
+        return String(payload.errmsg ?? payload.errorMsg ?? payload.message ?? 'success=false');
+    }
+
+    const code = payload.code;
+    if ((typeof code === 'number' || typeof code === 'string')
+        && (payload.message || payload.msg || payload.errorMsg || payload.errmsg)
+    ) {
+        const normalized = String(code).trim().toUpperCase();
+        if (!['0', 'SUCCESS', 'OK', '200'].includes(normalized)) {
+            return String(payload.message ?? payload.msg ?? payload.errorMsg ?? payload.errmsg);
+        }
+    }
+
+    return null;
+}
+
 export function cleanupCardCache(): void {
     const now = Date.now();
     for (const [cardInstanceId, instance] of aiCardInstances.entries()) {
@@ -371,7 +436,6 @@ export async function createAICard(
         log?.info?.(`[DingTalk][AICard] Creating card: ${cardInstanceId}`);
 
         const isGroup = !isDirect;
-        const targetUserId = userId || conversationId;
 
         const createAndDeliverBody = {
             cardTemplateId: config.cardTemplateId || '382e4302-551d-4880-bf29-a30acfab2e71.schema',
@@ -380,14 +444,7 @@ export async function createAICard(
                 cardParamMap: {},
             },
             callbackType: 'STREAM',
-            imGroupOpenSpaceModel: { supportForward: true },
-            imRobotOpenSpaceModel: { supportForward: true },
-            openSpaceId: isGroup
-                ? `dtv1.card//IM_GROUP.${conversationId}`
-                : `dtv1.card//IM_ROBOT.${targetUserId}`,
-            userIdType: 1,
-            imGroupOpenDeliverModel: isGroup ? { robotCode: config.robotCode || config.clientId } : undefined,
-            imRobotOpenDeliverModel: !isGroup ? { spaceType: 'IM_ROBOT' } : undefined,
+            ...resolveCardDeliveryTarget(config, conversationId, isDirect, userId),
         };
 
         if (!isGroup && !userId) {
@@ -396,16 +453,11 @@ export async function createAICard(
 
         log?.debug?.(`[DingTalk][AICard] Request body: ${JSON.stringify(createAndDeliverBody)}`);
 
-        const resp = await axios.post(
+        const resp = await postWithRetry(
             `${DINGTALK_API}/v1.0/card/instances/createAndDeliver`,
             createAndDeliverBody,
-            {
-                headers: {
-                    'x-acs-dingtalk-access-token': token,
-                    'Content-Type': 'application/json',
-                },
-                timeout: 15000, // 15 second timeout
-            }
+            token,
+            log
         );
 
         log?.info?.(`[DingTalk][AICard] Card created successfully, status: ${resp.status}`);
@@ -472,9 +524,6 @@ export async function sendExecApprovalButtonCard(
 
     const token = await getAccessToken(config, log);
     const cardInstanceId = `card_${randomUUID()}`;
-    const isGroup = !isDirect;
-    const targetUserId = userId || conversationId;
-
     const createAndDeliverBody = {
         cardTemplateId: templateId,
         outTrackId: cardInstanceId,
@@ -482,14 +531,7 @@ export async function sendExecApprovalButtonCard(
         // In Stream mode (dingtalk-stream), callbacks are delivered via TOPIC_CARD.
         // Using STREAM here avoids createAndDeliver failures seen with CALLBACK.
         callbackType: 'STREAM',
-        imGroupOpenSpaceModel: { supportForward: true },
-        imRobotOpenSpaceModel: { supportForward: true },
-        openSpaceId: isGroup
-            ? `dtv1.card//IM_GROUP.${conversationId}`
-            : `dtv1.card//IM_ROBOT.${targetUserId}`,
-        userIdType: 1,
-        imGroupOpenDeliverModel: isGroup ? { robotCode: config.robotCode || config.clientId } : undefined,
-        imRobotOpenDeliverModel: !isGroup ? { spaceType: 'IM_ROBOT' } : undefined,
+        ...resolveCardDeliveryTarget(config, conversationId, isDirect, userId),
     };
 
     log?.debug?.(`[DingTalk][AICard] Exec approval card body: ${JSON.stringify(createAndDeliverBody)}`);
@@ -502,6 +544,67 @@ export async function sendExecApprovalButtonCard(
     );
 
     log?.info?.(`[DingTalk][AICard] Exec approval card sent, status: ${resp.status}`);
+    return { cardInstanceId };
+}
+
+function stringifyCardParamValue(value: unknown): string {
+    if (typeof value === 'string') {
+        return value;
+    }
+    try {
+        return JSON.stringify(value, null, 0);
+    } catch {
+        return '';
+    }
+}
+
+function normalizeCardParamMap(cardParamMap: Record<string, unknown>): Record<string, string> {
+    const normalized: Record<string, string> = {};
+    for (const [key, value] of Object.entries(cardParamMap)) {
+        normalized[key] = stringifyCardParamValue(value);
+    }
+    return normalized;
+}
+
+/**
+ * Send a custom template card to current DingTalk target.
+ */
+export async function sendTemplateCard(
+    config: DingTalkConfig,
+    conversationId: string,
+    isDirect: boolean,
+    userId: string | undefined,
+    templateId: string,
+    cardParamMap: Record<string, unknown>,
+    log?: Logger
+): Promise<{ cardInstanceId: string }> {
+    const trimmedTemplateId = templateId.trim();
+    if (!trimmedTemplateId) {
+        throw new Error('Missing card templateId');
+    }
+
+    const token = await getAccessToken(config, log);
+    const cardInstanceId = `card_${randomUUID()}`;
+    const createAndDeliverBody = {
+        cardTemplateId: trimmedTemplateId,
+        outTrackId: cardInstanceId,
+        cardData: {
+            cardParamMap: normalizeCardParamMap(cardParamMap),
+        },
+        callbackType: 'STREAM',
+        ...resolveCardDeliveryTarget(config, conversationId, isDirect, userId),
+    };
+
+    log?.debug?.(`[DingTalk][AICard] Custom card body: ${JSON.stringify(createAndDeliverBody)}`);
+
+    const resp = await postWithRetry(
+        `${DINGTALK_API}/v1.0/card/instances/createAndDeliver`,
+        createAndDeliverBody,
+        token,
+        log
+    );
+
+    log?.info?.(`[DingTalk][AICard] Custom card sent, status: ${resp.status}`);
     return { cardInstanceId };
 }
 
@@ -523,6 +626,14 @@ async function postWithRetry(
                 },
                 timeout: 15000,
             });
+            const businessError = extractCreateAndDeliverError(resp.data);
+            if (businessError) {
+                const error = new Error(`DingTalk createAndDeliver business error: ${businessError}`) as Error & {
+                    response?: { status: number; data: unknown };
+                };
+                error.response = { status: resp.status, data: resp.data };
+                throw error;
+            }
             return { status: resp.status, data: resp.data };
         } catch (err) {
             const error = err as { response?: { status?: number; data?: unknown } };
