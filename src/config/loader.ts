@@ -230,6 +230,10 @@ function normalizeMemoryConfig(config: Config): void {
 
     config.agent.memory.retrieval.max_results = Math.max(1, Math.floor(config.agent.memory.retrieval.max_results));
     config.agent.memory.retrieval.min_score = Math.max(0, Math.min(1, config.agent.memory.retrieval.min_score));
+    config.agent.memory.retrieval.max_injected_chars = Math.max(
+        500,
+        Math.floor(config.agent.memory.retrieval.max_injected_chars)
+    );
     config.agent.memory.retrieval.sync_min_interval_ms = Math.max(1000, Math.floor(config.agent.memory.retrieval.sync_min_interval_ms));
     config.agent.memory.retrieval.hybrid_vector_weight = Math.max(0, Math.min(1, config.agent.memory.retrieval.hybrid_vector_weight));
     config.agent.memory.retrieval.hybrid_fts_weight = Math.max(0, Math.min(1, config.agent.memory.retrieval.hybrid_fts_weight));

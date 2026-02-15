@@ -1,4 +1,9 @@
 import type { CompactionConfig } from '../config.js';
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import { countTokensWithModel, getEffectiveAutoCompactThreshold } from '../compaction/index.js';
+
+const MEMORY_FLUSH_TRIGGER_RATIO = 0.9;
+const MEMORY_FLUSH_HYSTERESIS_RATIO = 0.85;
 
 /**
  * Estimate token count for a text string
@@ -27,6 +32,7 @@ export interface MemoryFlushState {
     lastFlushTokens: number;  // Token count at last flush
     lastFlushAt: number;
     flushCount: number;
+    flushCycleArmed: boolean;
     conversationSummary: string[];  // Track key points from conversation
 }
 
@@ -39,7 +45,32 @@ export function createMemoryFlushState(): MemoryFlushState {
         lastFlushTokens: 0,
         lastFlushAt: 0,
         flushCount: 0,
+        flushCycleArmed: true,
         conversationSummary: [],
+    };
+}
+
+export function getMemoryFlushTriggerThreshold(config: CompactionConfig): number {
+    const autoCompactThreshold = getEffectiveAutoCompactThreshold(config);
+    return Math.max(1, Math.floor(autoCompactThreshold * MEMORY_FLUSH_TRIGGER_RATIO));
+}
+
+export function getMemoryFlushRearmThreshold(config: CompactionConfig): number {
+    const triggerThreshold = getMemoryFlushTriggerThreshold(config);
+    return Math.max(1, Math.floor(triggerThreshold * MEMORY_FLUSH_HYSTERESIS_RATIO));
+}
+
+function maybeRearmFlushCycle(state: MemoryFlushState, config: CompactionConfig): MemoryFlushState {
+    if (state.flushCycleArmed) {
+        return state;
+    }
+    const rearmThreshold = getMemoryFlushRearmThreshold(config);
+    if (state.totalTokens > rearmThreshold) {
+        return state;
+    }
+    return {
+        ...state,
+        flushCycleArmed: true,
     };
 }
 
@@ -51,10 +82,10 @@ export function shouldTriggerMemoryFlush(
     config: CompactionConfig
 ): boolean {
     if (!config.enabled) return false;
-
-    // Trigger memory flush slightly before auto-compact threshold
-    const flushThreshold = config.auto_compact_threshold * 0.9;
-
+    if (!state.flushCycleArmed) {
+        return false;
+    }
+    const flushThreshold = getMemoryFlushTriggerThreshold(config);
     return state.totalTokens >= flushThreshold;
 }
 
@@ -103,13 +134,47 @@ export function buildMemoryFlushPrompt(): string {
  */
 export function updateTokenCount(
     state: MemoryFlushState,
-    text: string
+    text: string,
+    config?: CompactionConfig,
 ): MemoryFlushState {
     const newTokens = estimateTokens(text);
-    return {
+    const nextState = {
         ...state,
         totalTokens: state.totalTokens + newTokens,
     };
+    if (!config) {
+        return nextState;
+    }
+    return maybeRearmFlushCycle(nextState, config);
+}
+
+export async function updateTokenCountWithModel(
+    state: MemoryFlushState,
+    text: string,
+    model?: BaseChatModel,
+    config?: CompactionConfig,
+): Promise<MemoryFlushState> {
+    const newTokens = await countTokensWithModel(text, model);
+    const nextState = {
+        ...state,
+        totalTokens: state.totalTokens + newTokens,
+    };
+    if (!config) {
+        return nextState;
+    }
+    return maybeRearmFlushCycle(nextState, config);
+}
+
+export function setTotalTokens(
+    state: MemoryFlushState,
+    totalTokens: number,
+    config: CompactionConfig,
+): MemoryFlushState {
+    const nextState = {
+        ...state,
+        totalTokens: Math.max(0, Math.floor(totalTokens)),
+    };
+    return maybeRearmFlushCycle(nextState, config);
 }
 
 /**
@@ -122,6 +187,7 @@ export function markFlushCompleted(state: MemoryFlushState): MemoryFlushState {
         lastFlushTokens: state.totalTokens,
         lastFlushAt: Date.now(),
         flushCount: state.flushCount + 1,
+        flushCycleArmed: false,
         conversationSummary: [],  // Clear summary after flush
     };
 }
@@ -139,7 +205,9 @@ export function isNoReplyResponse(response: string): boolean {
  */
 export function getTokenUsageInfo(state: MemoryFlushState, config: CompactionConfig): string {
     const percentage = Math.round((state.totalTokens / config.context_window) * 100);
-    return `[Token 使用: ${formatTokens(state.totalTokens)}/${formatTokens(config.context_window)} (${percentage}%), flush 次数: ${state.flushCount}]`;
+    const flushThreshold = getMemoryFlushTriggerThreshold(config);
+    const rearmThreshold = getMemoryFlushRearmThreshold(config);
+    return `[Token 使用: ${formatTokens(state.totalTokens)}/${formatTokens(config.context_window)} (${percentage}%), flush 次数: ${state.flushCount}, flush armed: ${state.flushCycleArmed ? 'yes' : 'no'}, flush 阈值: ${formatTokens(flushThreshold)}, rearm 阈值: ${formatTokens(rearmThreshold)}]`;
 }
 
 function formatTokens(tokens: number): string {

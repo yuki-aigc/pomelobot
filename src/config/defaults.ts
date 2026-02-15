@@ -61,6 +61,7 @@ export const DEFAULT_CONFIG: Config = {
                 mode: 'keyword' as const,
                 max_results: 8,
                 min_score: 0.1,
+                max_injected_chars: 6000,
                 sync_on_search: true,
                 sync_min_interval_ms: 20000,
                 hybrid_vector_weight: 0.6,

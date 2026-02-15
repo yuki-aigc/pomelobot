@@ -89,6 +89,7 @@ const configSchemaInternal = z.object({
                 mode: z.enum(['keyword', 'fts', 'vector', 'hybrid']),
                 max_results: z.number().int().positive(),
                 min_score: z.number().min(0).max(1),
+                max_injected_chars: z.number().int().positive(),
                 sync_on_search: z.boolean(),
                 sync_min_interval_ms: z.number().int().positive(),
                 hybrid_vector_weight: z.number().min(0).max(1),

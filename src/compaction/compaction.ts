@@ -1,4 +1,12 @@
 import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
+
+const MESSAGE_TOKEN_OVERHEAD = 4;
+const MIN_CONTEXT_BUDGET_TOKENS = 1;
+
+type TokenAwareModel = BaseChatModel & {
+    getNumTokens?: (text: string) => Promise<number>;
+};
 
 /**
  * Estimate token count for a message
@@ -28,7 +36,7 @@ export function estimateMessageTokens(message: BaseMessage): number {
         : JSON.stringify(message.content);
 
     // Add overhead for role and structure
-    return estimateTokens(content) + 4;
+    return estimateTokens(content) + MESSAGE_TOKEN_OVERHEAD;
 }
 
 /**
@@ -46,12 +54,87 @@ export interface CompactionConfig {
     max_history_share: number;
 }
 
+function roleLabelForMessage(message: BaseMessage): string {
+    const type = message._getType();
+    if (type === 'human') return 'user';
+    if (type === 'ai') return 'assistant';
+    if (type === 'system') return 'system';
+    return type;
+}
+
+function serializeMessageForTokenCount(message: BaseMessage): string {
+    const content = typeof message.content === 'string'
+        ? message.content
+        : JSON.stringify(message.content);
+    return `[${roleLabelForMessage(message)}]\n${content}`;
+}
+
+async function tryCountTokensByModel(text: string, model?: BaseChatModel): Promise<number | null> {
+    if (!text) {
+        return 0;
+    }
+    if (!model) {
+        return null;
+    }
+    const tokenAwareModel = model as TokenAwareModel;
+    if (typeof tokenAwareModel.getNumTokens !== 'function') {
+        return null;
+    }
+    try {
+        const counted = await tokenAwareModel.getNumTokens(text);
+        if (Number.isFinite(counted) && counted >= 0) {
+            return Math.ceil(counted);
+        }
+    } catch {
+        // Fallback to heuristic if provider tokenizer is unavailable.
+    }
+    return null;
+}
+
+export function getCompactionHardContextBudget(config: CompactionConfig): number {
+    return Math.max(MIN_CONTEXT_BUDGET_TOKENS, config.context_window - config.reserve_tokens);
+}
+
+export function getEffectiveAutoCompactThreshold(config: CompactionConfig): number {
+    return Math.min(config.auto_compact_threshold, getCompactionHardContextBudget(config));
+}
+
+export function getCompactionHistoryTokenBudget(config: CompactionConfig): number {
+    return Math.max(
+        MIN_CONTEXT_BUDGET_TOKENS,
+        Math.floor(getCompactionHardContextBudget(config) * config.max_history_share),
+    );
+}
+
+export async function countTokensWithModel(text: string, model?: BaseChatModel): Promise<number> {
+    const normalized = text ?? '';
+    const modelTokens = await tryCountTokensByModel(normalized, model);
+    if (modelTokens !== null) {
+        return modelTokens;
+    }
+    return estimateTokens(normalized);
+}
+
+export async function countMessageTokensWithModel(message: BaseMessage, model?: BaseChatModel): Promise<number> {
+    const serialized = serializeMessageForTokenCount(message);
+    const contentTokens = await countTokensWithModel(serialized, model);
+    return contentTokens + MESSAGE_TOKEN_OVERHEAD;
+}
+
+export async function countTotalTokensWithModel(messages: BaseMessage[], model?: BaseChatModel): Promise<number> {
+    if (messages.length === 0) {
+        return 0;
+    }
+    const counts = await Promise.all(messages.map((message) => countMessageTokensWithModel(message, model)));
+    return counts.reduce((sum, value) => sum + value, 0);
+}
+
 /**
  * Check if auto-compaction should be triggered
  */
 export function shouldAutoCompact(totalTokens: number, config: CompactionConfig): boolean {
     if (!config.enabled) return false;
-    return totalTokens >= config.auto_compact_threshold;
+    return totalTokens >= getEffectiveAutoCompactThreshold(config);
 }
 
 /**

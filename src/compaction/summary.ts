@@ -1,7 +1,7 @@
 import type { BaseMessage } from '@langchain/core/messages';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import { estimateMessageTokens } from './compaction.js';
+import { countMessageTokensWithModel, countTotalTokensWithModel, estimateMessageTokens } from './compaction.js';
 
 const SUMMARY_SYSTEM_PROMPT = `你是一个对话摘要助手。请将以下对话历史压缩成简洁的摘要，保留：
 1. 关键决策和结论
@@ -77,7 +77,7 @@ export async function compactMessages(
     tokensBefore: number;
     tokensAfter: number;
 }> {
-    const tokensBefore = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+    const tokensBefore = await countTotalTokensWithModel(messages, model);
 
     if (tokensBefore <= maxTokens) {
         return {
@@ -93,15 +93,18 @@ export async function compactMessages(
     const conversationMessages = messages.filter(m => m._getType() !== 'system');
 
     // Calculate how many tokens we can use for conversation
-    const systemTokens = systemMessages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+    const systemTokens = await countTotalTokensWithModel(systemMessages, model);
     const availableForConversation = maxTokens - systemTokens - 500; // Reserve 500 for summary
 
     // Find the split point - keep recent messages within budget
+    const conversationTokenCounts = await Promise.all(
+        conversationMessages.map((message) => countMessageTokensWithModel(message, model)),
+    );
     let keptTokens = 0;
     let splitIndex = conversationMessages.length;
 
     for (let i = conversationMessages.length - 1; i >= 0; i--) {
-        const msgTokens = estimateMessageTokens(conversationMessages[i]);
+        const msgTokens = conversationTokenCounts[i] ?? estimateMessageTokens(conversationMessages[i]);
         if (keptTokens + msgTokens <= availableForConversation * 0.6) { // Keep 60% for recent
             keptTokens += msgTokens;
             splitIndex = i;
@@ -127,7 +130,7 @@ export async function compactMessages(
         ...toKeep,
     ];
 
-    const tokensAfter = newMessages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+    const tokensAfter = await countTotalTokensWithModel(newMessages, model);
 
     return {
         messages: newMessages,

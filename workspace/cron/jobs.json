@@ -7,7 +7,7 @@
       "description": "自动创建，请勿删除。[system:auto-memory-save-4am:v1]",
       "enabled": true,
       "createdAtMs": 1770709421291,
-      "updatedAtMs": 1770714299536,
+      "updatedAtMs": 1771132833914,
       "schedule": {
         "kind": "cron",
         "expr": "0 4 * * *",
@@ -18,12 +18,13 @@
         "message": "请执行每日记忆归档任务。\n要求：\n1. 回顾最近24小时对话中的关键事实、告警分析、定位结论、处置动作、遗留风险与待办。\n2. 调用 memory_save，target 必须是 daily；内容需要结构化且可复盘。\n3. 完成后在回复末尾明确输出: memory_saved。\n注意：若你没有调用 memory_save 就结束任务，视为失败。"
       },
       "delivery": {
-        "target": "cidxxxxxxxxxxxx",
+        "channel": "dingtalk",
+        "target": "cid1oT+vAKivWhMDd1ZK7awqA==",
         "useMarkdown": true,
         "title": "SREBot 定时任务"
       },
       "state": {
-        "nextRunAtMs": 1771012800000
+        "nextRunAtMs": 1771185600000
       }
     }
   ]

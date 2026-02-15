@@ -14,24 +14,25 @@ import {
     listConfiguredModels,
 } from './llm.js';
 import {
-    estimateTotalTokens,
-    shouldAutoCompact,
-    getContextUsageInfo,
-    formatTokenCount,
     compactMessages,
+    formatTokenCount,
+    getCompactionHistoryTokenBudget,
+    getContextUsageInfo,
+    shouldAutoCompact,
+    estimateTotalTokens,
 } from './compaction/index.js';
 import { parseCommand, handleCommand, type CommandContext } from './commands/index.js';
 import {
     createMemoryFlushState,
-    estimateTokens,
-    updateTokenCount,
-    shouldTriggerMemoryFlush,
-    markFlushCompleted,
-    isNoReplyResponse,
-    getTokenUsageInfo,
     buildMemoryFlushPrompt,
+    getTokenUsageInfo,
+    isNoReplyResponse,
+    markFlushCompleted,
     recordSessionTranscript,
+    setTotalTokens,
+    shouldTriggerMemoryFlush,
     type MemoryFlushState,
+    updateTokenCountWithModel,
 } from './middleware/index.js';
 
 // ANSI terminal colors
@@ -297,11 +298,7 @@ async function main() {
 
             flushState = markFlushCompleted(flushState);
             if (options?.preserveTokenCount) {
-                flushState = {
-                    ...flushState,
-                    totalTokens: tokensBeforeFlush,
-                    lastFlushTokens: tokensBeforeFlush,
-                };
+                flushState = setTotalTokens(flushState, tokensBeforeFlush, config.agent.compaction);
             }
         } catch (error) {
             process.stdout.write(` ${colors.red}✗${colors.reset}\n`);
@@ -328,12 +325,12 @@ async function main() {
         process.stdout.write(`${colors.gray}● ${colors.reset}${colors.dim}Auto-compacting context...${colors.reset}`);
 
         try {
-            const maxTokens = Math.floor(config.agent.compaction.context_window * config.agent.compaction.max_history_share);
+            const maxTokens = getCompactionHistoryTokenBudget(config.agent.compaction);
             const result = await compactMessages(messageHistory, compactionModel, maxTokens);
 
             messageHistory = result.messages;
             flushState = markFlushCompleted(flushState);
-            flushState = { ...flushState, totalTokens: result.tokensAfter };
+            flushState = setTotalTokens(flushState, result.tokensAfter, config.agent.compaction);
 
             const saved = result.tokensBefore - result.tokensAfter;
             process.stdout.write(` ${colors.green}✓${colors.reset} (${formatTokenCount(saved)} saved)\n`);
@@ -428,7 +425,7 @@ async function main() {
                             await executeMemoryFlush();
                         }
                         try {
-                            const maxTokens = Math.floor(config.agent.compaction.context_window * config.agent.compaction.max_history_share);
+                            const maxTokens = getCompactionHistoryTokenBudget(config.agent.compaction);
                             const compactResult = await compactMessages(
                                 messageHistory,
                                 compactionModel,
@@ -437,7 +434,7 @@ async function main() {
                             );
                             messageHistory = compactResult.messages;
                             flushState = markFlushCompleted(flushState);
-                            flushState = { ...flushState, totalTokens: compactResult.tokensAfter };
+                            flushState = setTotalTokens(flushState, compactResult.tokensAfter, config.agent.compaction);
 
                             const saved = compactResult.tokensBefore - compactResult.tokensAfter;
                             responseText = saved > 0
@@ -463,8 +460,14 @@ async function main() {
             }
 
             hasConversation = true;
-            flushState = updateTokenCount(flushState, userInput);
-            totalInputTokens += estimateTokens(userInput);
+            const tokensBeforeInput = flushState.totalTokens;
+            flushState = await updateTokenCountWithModel(
+                flushState,
+                userInput,
+                compactionModel,
+                config.agent.compaction,
+            );
+            totalInputTokens += Math.max(0, flushState.totalTokens - tokensBeforeInput);
             await recordSessionTranscript(memoryWorkspacePath, config, 'user', userInput)
                 .catch(() => undefined);
 
@@ -537,8 +540,14 @@ async function main() {
                 }
 
                 // Update token count and message history
-                flushState = updateTokenCount(flushState, fullResponse);
-                totalOutputTokens += estimateTokens(fullResponse);
+                const tokensBeforeOutput = flushState.totalTokens;
+                flushState = await updateTokenCountWithModel(
+                    flushState,
+                    fullResponse,
+                    compactionModel,
+                    config.agent.compaction,
+                );
+                totalOutputTokens += Math.max(0, flushState.totalTokens - tokensBeforeOutput);
                 await recordSessionTranscript(memoryWorkspacePath, config, 'assistant', fullResponse)
                     .catch(() => undefined);
                 lastUpdatedAt = new Date();

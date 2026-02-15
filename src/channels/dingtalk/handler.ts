@@ -32,20 +32,23 @@ import { AICardStatus } from './types.js';
 import { hasPendingApprovalForKey, tryHandleExecApprovalReply } from './approvals.js';
 import {
     createMemoryFlushState,
-    estimateTokens,
-    updateTokenCount,
-    shouldTriggerMemoryFlush,
-    markFlushCompleted,
-    isNoReplyResponse,
     buildMemoryFlushPrompt,
+    isNoReplyResponse,
+    markFlushCompleted,
     recordSessionTranscript,
+    setTotalTokens,
+    shouldTriggerMemoryFlush,
     type MemoryFlushState,
+    updateTokenCountWithModel,
 } from '../../middleware/index.js';
 import {
-    shouldAutoCompact,
     compactMessages,
     formatTokenCount,
+    getCompactionHardContextBudget,
+    getCompactionHistoryTokenBudget,
     getContextUsageInfo,
+    getEffectiveAutoCompactThreshold,
+    shouldAutoCompact,
 } from '../../compaction/index.js';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { Config } from '../../config.js';
@@ -1566,6 +1569,8 @@ function buildStatusMessage(params: {
     const activeAlias = getActiveModelAlias(config);
     const activeModel = getActiveModelEntry(config);
     const contextConfig = config.agent.compaction;
+    const effectiveThreshold = getEffectiveAutoCompactThreshold(contextConfig);
+    const hardBudget = getCompactionHardContextBudget(contextConfig);
     const appVersion = process.env.npm_package_version || '1.0.0';
     const contextRatio = (session.totalTokens / contextConfig.context_window) * 100;
     const contextPercent = contextRatio >= 1
@@ -1588,7 +1593,7 @@ function buildStatusMessage(params: {
         `- 运行模式：dingtalk（think=low，queue=collect depth=0）`,
         '',
         getContextUsageInfo(session.totalTokens, contextConfig),
-        `自动压缩阈值：${formatTokenCount(contextConfig.auto_compact_threshold)}`,
+        `自动压缩阈值：${formatTokenCount(effectiveThreshold)}（hard budget: ${formatTokenCount(hardBudget)}）`,
     ].join('\n');
 }
 
@@ -2052,11 +2057,21 @@ async function runAgentInvokeStage(
 
     // Create flush state from session
     let flushState: MemoryFlushState = createMemoryFlushState();
-    flushState = { ...flushState, totalTokens: session.totalTokens };
+    flushState = setTotalTokens(flushState, session.totalTokens, config.agent.compaction);
+
+    // Reuse shared compaction model
+    const compactionModel = await getCompactionModel(config);
+    const compactionConfig = config.agent.compaction;
 
     // Update token count with user input
-    flushState = updateTokenCount(flushState, content.text);
-    session.totalInputTokens += estimateTokens(content.text);
+    const tokensBeforeInput = flushState.totalTokens;
+    flushState = await updateTokenCountWithModel(
+        flushState,
+        content.text,
+        compactionModel,
+        compactionConfig,
+    );
+    session.totalInputTokens += Math.max(0, flushState.totalTokens - tokensBeforeInput);
     await persistSessionEvent({
         role: 'user',
         content: content.text,
@@ -2067,10 +2082,6 @@ async function runAgentInvokeStage(
         config,
         log,
     });
-
-    // Reuse shared compaction model
-    const compactionModel = await getCompactionModel(config);
-    const compactionConfig = config.agent.compaction;
 
     // Check if we need auto-compaction before processing
     flushState = await executeAutoCompact(
@@ -2490,10 +2501,15 @@ async function runPersistenceStage(
     } = stage;
     const { config, log } = ctx;
     const fullResponse = invokeStage.fullResponse;
-    let flushState = updateTokenCount(invokeStage.flushState, fullResponse);
+    let flushState = await updateTokenCountWithModel(
+        invokeStage.flushState,
+        fullResponse,
+        invokeStage.compactionModel,
+        invokeStage.compactionConfig,
+    );
 
     // Update token count and message history
-    session.totalOutputTokens += estimateTokens(fullResponse);
+    session.totalOutputTokens += Math.max(0, flushState.totalTokens - invokeStage.flushState.totalTokens);
     await persistSessionEvent({
         role: 'assistant',
         content: fullResponse,
@@ -2543,6 +2559,7 @@ async function executeMemoryFlush(
     agent: RuntimeAgent,
     session: SessionState,
     flushState: MemoryFlushState,
+    compactionConfig: CompactionConfig,
     log: Logger,
     options?: { preserveTokenCount?: boolean }
 ): Promise<MemoryFlushState> {
@@ -2575,11 +2592,7 @@ async function executeMemoryFlush(
 
         const nextState = markFlushCompleted(flushState);
         if (options?.preserveTokenCount) {
-            return {
-                ...nextState,
-                totalTokens: tokensBeforeFlush,
-                lastFlushTokens: tokensBeforeFlush,
-            };
+            return setTotalTokens(nextState, tokensBeforeFlush, compactionConfig);
         }
         return nextState;
     } catch (error) {
@@ -2610,7 +2623,7 @@ async function executeAutoCompact(
 
     // First: flush memory to save important info
     if (shouldTriggerMemoryFlush(flushState, compactionConfig)) {
-        flushState = await executeMemoryFlush(agent, session, flushState, log, { preserveTokenCount: true });
+        flushState = await executeMemoryFlush(agent, session, flushState, compactionConfig, log, { preserveTokenCount: true });
     }
 
     if (!shouldAutoCompact(tokensBeforeAutoCompact, compactionConfig)) {
@@ -2621,14 +2634,14 @@ async function executeAutoCompact(
 
     // Then: compact context
     try {
-        const maxTokens = Math.floor(compactionConfig.context_window * compactionConfig.max_history_share);
+        const maxTokens = getCompactionHistoryTokenBudget(compactionConfig);
         const result = await compactMessages(session.messageHistory, compactionModel, maxTokens);
 
         session.messageHistory = result.messages;
         session.totalTokens = result.tokensAfter;
         session.compactionCount += 1;
         flushState = markFlushCompleted(flushState);
-        flushState = { ...flushState, totalTokens: result.tokensAfter };
+        flushState = setTotalTokens(flushState, result.tokensAfter, compactionConfig);
 
         const saved = result.tokensBefore - result.tokensAfter;
         log.info(`[DingTalk] Compaction completed, saved ${formatTokenCount(saved)} tokens`);
@@ -2717,12 +2730,13 @@ export async function flushSessionsOnShutdown(params: {
         const shouldFlush = session.messageHistory.length > 0 && session.totalTokens > 0;
         if (shouldFlush) {
             try {
-                const flushState: MemoryFlushState = {
-                    ...createMemoryFlushState(),
-                    totalTokens: session.totalTokens,
-                };
+                const flushState = setTotalTokens(
+                    createMemoryFlushState(),
+                    session.totalTokens,
+                    config.agent.compaction,
+                );
                 const nextState = await withTimeout(
-                    executeMemoryFlush(agent, session, flushState, log),
+                    executeMemoryFlush(agent, session, flushState, config.agent.compaction, log),
                     flushTimeoutMs,
                     `memory flush timeout after ${flushTimeoutMs}ms`
                 );

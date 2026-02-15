@@ -2,7 +2,12 @@ import crypto from 'node:crypto';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { CompactionConfig } from '../compaction/index.js';
 import type { LLMProvider } from '../config.js';
-import { formatTokenCount, getContextUsageInfo } from '../compaction/index.js';
+import {
+    formatTokenCount,
+    getCompactionHardContextBudget,
+    getContextUsageInfo,
+    getEffectiveAutoCompactThreshold,
+} from '../compaction/index.js';
 
 export interface ModelOption {
     alias: string;
@@ -149,6 +154,8 @@ function handleStatusCommand(context: CommandContext): CommandResult {
     const thinkLevel = context.thinkLevel || 'low';
     const queueName = context.queueName || 'collect';
     const queueDepth = context.queueDepth ?? 0;
+    const effectiveThreshold = getEffectiveAutoCompactThreshold(context.config);
+    const hardBudget = getCompactionHardContextBudget(context.config);
 
     const response = `🤖 SRE Bot ${context.appVersion}
 🧠 Model: ${modelLabel} · 🔑 api-key ${keyLabel} (${model?.provider || 'n/a'}:${context.activeModelAlias})
@@ -159,7 +166,7 @@ function handleStatusCommand(context: CommandContext): CommandResult {
 🪢 Queue: ${queueName} (depth ${queueDepth})
 
 ${getContextUsageInfo(context.currentTokens, context.config)}
-自动压缩阈值: ${formatTokenCount(context.config.auto_compact_threshold)}`;
+自动压缩阈值: ${formatTokenCount(effectiveThreshold)}（hard budget: ${formatTokenCount(hardBudget)}）`;
 
     return {
         handled: true,

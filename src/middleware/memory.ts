@@ -4,6 +4,21 @@ import type { Config } from '../config.js';
 import { resolveMemoryScope } from './memory-scope.js';
 import { getMemoryRuntime } from './memory-runtime.js';
 
+function clampInjectedMemoryText(text: string, maxChars: number): string {
+    const normalized = text ?? '';
+    const budget = Math.max(1, Math.floor(maxChars));
+    if (normalized.length <= budget) {
+        return normalized;
+    }
+
+    const suffix = `\n...[memory output truncated at ${budget} chars]`;
+    if (suffix.length >= budget) {
+        return normalized.slice(0, budget);
+    }
+    const head = normalized.slice(0, budget - suffix.length).trimEnd();
+    return `${head}${suffix}`;
+}
+
 /**
  * Load memory context for system prompt injection.
  *
@@ -26,6 +41,7 @@ export function loadMemoryContext(workspacePath: string): string {
  */
 export function createMemoryTools(workspacePath: string, config: Config) {
     const runtimePromise = getMemoryRuntime(workspacePath, config);
+    const maxInjectedChars = config.agent.memory.retrieval.max_injected_chars;
 
     const memorySave = tool(
         async ({ content, target }: { content: string; target: 'daily' | 'long-term' }) => {
@@ -64,10 +80,10 @@ export function createMemoryTools(workspacePath: string, config: Config) {
                     ].join('\n');
                 });
 
-            return [
+            return clampInjectedMemoryText([
                 `找到 ${hits.length} 条相关记忆（scope=${scope.key}）:`,
                 ...lines,
-            ].join('\n');
+            ].join('\n'), maxInjectedChars);
         },
         {
             name: 'memory_search',
@@ -87,7 +103,7 @@ export function createMemoryTools(workspacePath: string, config: Config) {
                 `已读取记忆片段: ${result.path}`,
                 `(scope=${result.scope}, source=${result.source}, from=${result.fromLine}, lines=${result.lineCount}, to=${result.toLine}${result.truncated ? ', truncated=true' : ''})`,
             ].join(' ');
-            return `${meta}\n${result.text || '(空结果)'}`;
+            return clampInjectedMemoryText(`${meta}\n${result.text || '(空结果)'}`, maxInjectedChars);
         },
         {
             name: 'memory_get',

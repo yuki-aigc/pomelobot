@@ -57,6 +57,7 @@ export interface AgentMemoryRetrievalConfig {
     mode: AgentMemoryRetrievalMode;
     max_results: number;
     min_score: number;
+    max_injected_chars: number;
     sync_on_search: boolean;
     sync_min_interval_ms: number;
     hybrid_vector_weight: number;
