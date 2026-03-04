@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     buildAttachmentBasePath,
     buildContentDisposition,
+    detectWebMediaType,
     guessMimeType,
     isPathInsideDir,
     sanitizeFileName,
@@ -26,4 +27,10 @@ test('buildAttachmentBasePath and content disposition are stable', () => {
     assert.equal(buildAttachmentBasePath('/web'), '/web/attachments');
     assert.equal(buildAttachmentBasePath('/'), '/attachments');
     assert.match(buildContentDisposition('报告 1.md'), /filename\*=UTF-8''/);
+});
+
+test('detectWebMediaType distinguishes image and generic file', () => {
+    assert.equal(detectWebMediaType('photo.png', 'image/png'), 'image');
+    assert.equal(detectWebMediaType('photo.unknown', 'image/jpeg'), 'image');
+    assert.equal(detectWebMediaType('report.pdf', 'application/pdf'), 'file');
 });

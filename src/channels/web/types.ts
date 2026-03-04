@@ -48,6 +48,7 @@ export interface WebMessagePayload {
     nickName?: string;
     senderName?: string;
     text?: string;
+    attachments?: WebInboundAttachmentPayload[];
     metadata?: Record<string, unknown>;
 }
 
@@ -71,10 +72,39 @@ export interface WebAttachmentPayload {
     mimeType: string;
 }
 
+export interface WebUploadedAttachmentPayload {
+    upload_id: string;
+    uploadId: string;
+    name: string;
+    sizeBytes: number;
+    mimeType: string;
+    mime_type: string;
+    mediaType: 'image' | 'file';
+    media_type: 'image' | 'file';
+}
+
 export interface WebAttachmentRecord extends WebAttachmentPayload {
     path: string;
     createdAt: number;
     expiresAt: number;
+}
+
+export interface WebInboundAttachmentPayload {
+    upload_id?: string;
+    uploadId?: string;
+}
+
+export interface WebUploadRecord {
+    id: string;
+    name: string;
+    path: string;
+    sizeBytes: number;
+    mimeType: string;
+    mediaType: 'image' | 'file';
+    createdAt: number;
+    expiresAt: number;
+    userId?: string;
+    sessionId?: string;
 }
 
 export interface WebConnectionState {

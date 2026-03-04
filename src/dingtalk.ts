@@ -12,7 +12,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { Client as PgClient } from 'pg';
+import { Client as PgClient, type ClientConfig as PgClientConfig } from 'pg';
 import type { ExecApprovalRequest } from './agent.js';
 import { WORKING_SUMMARY_REQUIREMENTS, WORKING_SUMMARY_SCHEMA } from './compaction/summary-schema.js';
 import { loadConfig, type AgentMemoryConfig } from './config.js';
@@ -44,7 +44,7 @@ import {
 const AUTO_MEMORY_SAVE_JOB_NAME = '系统任务：每日记忆归档(04:00)';
 const AUTO_MEMORY_SAVE_JOB_MARKER = '[system:auto-memory-save-4am:v1]';
 const AUTO_MEMORY_SAVE_JOB_CRON_EXPR = '0 4 * * *';
-const STREAM_LOCK_WAIT_MS = 60_000;
+const DEFAULT_STREAM_LOCK_WAIT_MS = 120_000;
 const STREAM_LOCK_RETRY_MS = 1_000;
 
 function buildAutoMemorySaveJobDescription(): string {
@@ -66,7 +66,7 @@ export function buildAutoMemorySaveJobPrompt(): string {
     ].join('\n');
 }
 
-function buildPgClientConfig(memoryConfig: AgentMemoryConfig): ConstructorParameters<typeof PgClient>[0] | null {
+function buildPgClientConfig(memoryConfig: AgentMemoryConfig): PgClientConfig | null {
     const pg = memoryConfig.pgsql;
     if (pg.connection_string?.trim()) {
         return {
@@ -93,6 +93,108 @@ type StreamLockHandle = {
     release: () => Promise<void>;
 };
 
+type AdvisoryLockHolder = {
+    pid: number;
+    applicationName?: string;
+    state?: string;
+    clientAddr?: string;
+    backendStart?: string;
+    xactStart?: string;
+    queryStart?: string;
+    query?: string;
+};
+
+async function getCurrentPgBackendPid(client: PgClient): Promise<number | null> {
+    try {
+        const result = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        return result.rows[0]?.pid ?? null;
+    } catch {
+        return null;
+    }
+}
+
+async function listAdvisoryLockHolders(params: {
+    client: PgClient;
+    lockKey1: number;
+    lockKey2: number;
+}): Promise<AdvisoryLockHolder[]> {
+    const result = await params.client.query<{
+        pid: number;
+        application_name: string | null;
+        state: string | null;
+        client_addr: string | null;
+        backend_start: string | null;
+        xact_start: string | null;
+        query_start: string | null;
+        query: string | null;
+    }>(
+        `SELECT
+            l.pid,
+            a.application_name,
+            a.state,
+            a.client_addr::text AS client_addr,
+            a.backend_start::text AS backend_start,
+            a.xact_start::text AS xact_start,
+            a.query_start::text AS query_start,
+            a.query
+         FROM pg_locks l
+         LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+         WHERE l.locktype = 'advisory'
+           AND l.classid = $1
+           AND l.objid = $2
+           AND l.objsubid = 2
+           AND l.granted = true
+         ORDER BY a.backend_start NULLS LAST, l.pid`,
+        [params.lockKey1, params.lockKey2],
+    );
+
+    return result.rows.map((row) => ({
+        pid: row.pid,
+        applicationName: row.application_name || undefined,
+        state: row.state || undefined,
+        clientAddr: row.client_addr || undefined,
+        backendStart: row.backend_start || undefined,
+        xactStart: row.xact_start || undefined,
+        queryStart: row.query_start || undefined,
+        query: row.query || undefined,
+    }));
+}
+
+async function terminateAdvisoryLockHolders(params: {
+    client: PgClient;
+    holders: AdvisoryLockHolder[];
+    selfPid: number | null;
+    log: Logger;
+    instanceId: string;
+}): Promise<number> {
+    let terminatedCount = 0;
+    for (const holder of params.holders) {
+        if (!holder.pid || holder.pid === params.selfPid) {
+            continue;
+        }
+        try {
+            const result = await params.client.query<{ terminated: boolean }>(
+                'SELECT pg_terminate_backend($1) AS terminated',
+                [holder.pid],
+            );
+            const terminated = Boolean(result.rows[0]?.terminated);
+            params.log.warn(
+                `[DingTalk] advisory lock holder terminate ${terminated ? 'succeeded' : 'skipped'}: ` +
+                `instance=${params.instanceId} pid=${holder.pid} app=${holder.applicationName || ''} state=${holder.state || ''} client=${holder.clientAddr || ''}`,
+            );
+            if (terminated) {
+                terminatedCount += 1;
+            }
+        } catch (error) {
+            params.log.warn(
+                `[DingTalk] advisory lock holder terminate failed: instance=${params.instanceId} pid=${holder.pid} ` +
+                `${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+    }
+    return terminatedCount;
+}
+
 async function acquireDingTalkStreamLock(params: {
     config: ReturnType<typeof loadConfig>;
     clientId: string;
@@ -105,6 +207,9 @@ async function acquireDingTalkStreamLock(params: {
         return null;
     }
 
+    const streamLockWaitMs = Math.max(5_000, Math.floor(config.dingtalk?.streamLockWaitMs ?? DEFAULT_STREAM_LOCK_WAIT_MS));
+    const forceTerminateOnTimeout = Boolean(config.dingtalk?.streamLockForceTerminateOnTimeout);
+    const forceTerminateWaitMs = Math.max(1_000, Math.floor(config.dingtalk?.streamLockForceTerminateWaitMs ?? 15_000));
     const clientConfig = buildPgClientConfig(memoryConfig);
     if (!clientConfig) {
         return null;
@@ -113,7 +218,10 @@ async function acquireDingTalkStreamLock(params: {
     const lockDigest = createHash('sha256').update(`dingtalk-stream:${clientId}`).digest();
     const lockKey1 = lockDigest.readInt32BE(0);
     const lockKey2 = lockDigest.readInt32BE(4);
-    const client = new PgClient(clientConfig);
+    const client = new PgClient({
+        ...clientConfig,
+        application_name: `pomelobot-dingtalk-lock:${instanceId}`,
+    });
 
     try {
         await client.connect();
@@ -126,7 +234,8 @@ async function acquireDingTalkStreamLock(params: {
         return null;
     }
 
-    const deadline = Date.now() + STREAM_LOCK_WAIT_MS;
+    const selfPid = await getCurrentPgBackendPid(client);
+    const deadline = Date.now() + streamLockWaitMs;
     let attempt = 0;
     while (Date.now() < deadline) {
         attempt += 1;
@@ -162,8 +271,79 @@ async function acquireDingTalkStreamLock(params: {
         await new Promise((resolve) => setTimeout(resolve, STREAM_LOCK_RETRY_MS));
     }
 
+    if (forceTerminateOnTimeout) {
+        try {
+            const holders = await listAdvisoryLockHolders({
+                client,
+                lockKey1,
+                lockKey2,
+            });
+            if (holders.length > 0) {
+                for (const holder of holders) {
+                    log.warn(
+                        `[DingTalk] advisory lock holder detected: instance=${instanceId} pid=${holder.pid} ` +
+                        `app=${holder.applicationName || ''} state=${holder.state || ''} client=${holder.clientAddr || ''} ` +
+                        `backend_start=${holder.backendStart || ''}`,
+                    );
+                }
+                const terminatedCount = await terminateAdvisoryLockHolders({
+                    client,
+                    holders,
+                    selfPid,
+                    log,
+                    instanceId,
+                });
+                if (terminatedCount > 0) {
+                    const forceDeadline = Date.now() + forceTerminateWaitMs;
+                    while (Date.now() < forceDeadline) {
+                        try {
+                            const result = await client.query<{ locked: boolean }>(
+                                'SELECT pg_try_advisory_lock($1, $2) AS locked',
+                                [lockKey1, lockKey2],
+                            );
+                            if (result.rows[0]?.locked) {
+                                log.warn(
+                                    `[DingTalk] advisory lock takeover succeeded after terminating stale holder(s): instance=${instanceId} count=${terminatedCount}`,
+                                );
+                                return {
+                                    release: async () => {
+                                        try {
+                                            await client.query('SELECT pg_advisory_unlock($1, $2)', [lockKey1, lockKey2]);
+                                        } catch (error) {
+                                            log.warn(
+                                                `[DingTalk] advisory lock release failed: instance=${instanceId} ` +
+                                                `${error instanceof Error ? error.message : String(error)}`,
+                                            );
+                                        } finally {
+                                            await client.end().catch(() => undefined);
+                                        }
+                                    },
+                                };
+                            }
+                        } catch (error) {
+                            log.warn(
+                                `[DingTalk] advisory lock retry after terminate failed: instance=${instanceId} ` +
+                                `${error instanceof Error ? error.message : String(error)}`,
+                            );
+                            break;
+                        }
+                        await new Promise((resolve) => setTimeout(resolve, STREAM_LOCK_RETRY_MS));
+                    }
+                }
+            }
+        } catch (error) {
+            log.warn(
+                `[DingTalk] advisory lock holder inspection failed: instance=${instanceId} ` +
+                `${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+    }
+
     await client.end().catch(() => undefined);
-    throw new Error(`DingTalk stream lock held by another instance for more than ${STREAM_LOCK_WAIT_MS}ms`);
+    throw new Error(
+        `DingTalk stream lock held by another instance for more than ${streamLockWaitMs}ms`
+        + (forceTerminateOnTimeout ? ` (force terminate attempted for ${forceTerminateWaitMs}ms)` : ''),
+    );
 }
 
 function instrumentDingTalkClient(client: DWClient, log: Logger, instanceId: string): void {
@@ -482,23 +662,13 @@ export async function startDingTalkService(options?: {
     log.info('[DingTalk] Connecting to DingTalk Stream...');
     const streamInstanceId = `${hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
     const streamUA = `pomelobot/${streamInstanceId}`;
-    const streamLock = await acquireDingTalkStreamLock({
+    let streamLock: StreamLockHandle | null = await acquireDingTalkStreamLock({
         config,
         clientId: dingtalkConfig.clientId,
         log,
         instanceId: streamInstanceId,
     });
-
-    const client = new DWClient({
-        clientId: dingtalkConfig.clientId,
-        clientSecret: dingtalkConfig.clientSecret,
-        debug: dingtalkConfig.debug || false,
-        // Rely on Stream protocol ping/disconnect + SDK autoReconnect.
-        // The SDK's ws keepAlive timer is not cleared on socket close, only on disconnect().
-        keepAlive: false,
-        ua: streamUA,
-    });
-    instrumentDingTalkClient(client, log, streamInstanceId);
+    let client: DWClient | null = null;
 
     // Message handler context
     const ctx = {
@@ -598,47 +768,85 @@ export async function startDingTalkService(options?: {
     setCronService('dingtalk', cronService);
     setCronService(cronService);
 
-    gateway = new GatewayService({
-        onProcessInbound: async (message) => {
-            if (message.channel !== 'dingtalk') {
-                return { skipReply: true };
-            }
-            const raw = message.raw;
-            if (!raw || typeof raw !== 'object') {
-                throw new Error('DingTalk inbound missing raw payload');
-            }
-            const data = raw as DingTalkInboundMessage;
-            const isDirect = data.conversationType === '1';
-            const senderId = data.senderStaffId || data.senderId;
-            const senderName = data.senderNick || 'Unknown';
-            await withApprovalContext(
-                {
-                    dingtalkConfig: ctx.dingtalkConfig,
-                    conversationId: data.conversationId,
-                    isDirect,
-                    senderId,
-                    senderName,
-                    sessionWebhook: data.sessionWebhook,
-                    log: ctx.log,
-                },
-                () => handleMessage(data, ctx)
-            );
-            return { skipReply: true };
-        },
-        logger: toGatewayLogger(log),
-    });
     let isShuttingDown = false;
-    const dingtalkAdapter = createDingTalkChannelAdapter({
-        config: dingtalkConfig,
-        log,
-        client,
-        isShuttingDown: () => isShuttingDown,
-    });
-    gateway.registerAdapter(dingtalkAdapter);
-    await gateway.start();
+    try {
+        client = new DWClient({
+            clientId: dingtalkConfig.clientId,
+            clientSecret: dingtalkConfig.clientSecret,
+            debug: dingtalkConfig.debug || false,
+            // Rely on Stream protocol ping/disconnect + SDK autoReconnect.
+            // The SDK's ws keepAlive timer is not cleared on socket close, only on disconnect().
+            keepAlive: false,
+            ua: streamUA,
+        });
+        instrumentDingTalkClient(client, log, streamInstanceId);
 
-    // Connect to DingTalk
-    await client.connect();
+        gateway = new GatewayService({
+            onProcessInbound: async (message) => {
+                if (message.channel !== 'dingtalk') {
+                    return { skipReply: true };
+                }
+                const raw = message.raw;
+                if (!raw || typeof raw !== 'object') {
+                    throw new Error('DingTalk inbound missing raw payload');
+                }
+                const data = raw as DingTalkInboundMessage;
+                const isDirect = data.conversationType === '1';
+                const senderId = data.senderStaffId || data.senderId;
+                const senderName = data.senderNick || 'Unknown';
+                await withApprovalContext(
+                    {
+                        dingtalkConfig: ctx.dingtalkConfig,
+                        conversationId: data.conversationId,
+                        isDirect,
+                        senderId,
+                        senderName,
+                        sessionWebhook: data.sessionWebhook,
+                        log: ctx.log,
+                    },
+                    () => handleMessage(data, ctx)
+                );
+                return { skipReply: true };
+            },
+            logger: toGatewayLogger(log),
+        });
+        const dingtalkAdapter = createDingTalkChannelAdapter({
+            config: dingtalkConfig,
+            log,
+            client,
+            isShuttingDown: () => isShuttingDown,
+        });
+        gateway.registerAdapter(dingtalkAdapter);
+        await gateway.start();
+
+        // Connect to DingTalk
+        await client.connect();
+    } catch (error) {
+        if (gateway) {
+            try {
+                await gateway.stop();
+            } catch (stopError) {
+                log.warn('[DingTalk] gateway stop failed during startup rollback:', stopError instanceof Error ? stopError.message : String(stopError));
+            }
+            gateway = null;
+        }
+        if (client) {
+            try {
+                client.disconnect();
+            } catch (disconnectError) {
+                log.warn('[DingTalk] stream disconnect failed during startup rollback:', disconnectError instanceof Error ? disconnectError.message : String(disconnectError));
+            }
+        }
+        if (streamLock) {
+            try {
+                await streamLock.release();
+            } catch (releaseError) {
+                log.warn('[DingTalk] stream lock release failed during startup rollback:', releaseError instanceof Error ? releaseError.message : String(releaseError));
+            }
+            streamLock = null;
+        }
+        throw error;
+    }
     log.info('[DingTalk] Connected! Bot is now online and listening for messages.');
     console.log();
     console.log(`${colors.gray}Press Ctrl+C to stop the bot.${colors.reset}`);
@@ -654,7 +862,7 @@ export async function startDingTalkService(options?: {
 
         try {
             log.info('[DingTalk] Disconnecting DingTalk Stream before draining...');
-            client.disconnect();
+            client?.disconnect();
         } catch (error) {
             log.warn('[DingTalk] stream disconnect failed:', error instanceof Error ? error.message : String(error));
         }

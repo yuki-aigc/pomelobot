@@ -161,6 +161,9 @@
         "cardTemplateId": "",
         "showThinking": true,
         "debug": false,
+        "streamLockWaitMs": 120000,
+        "streamLockForceTerminateOnTimeout": false,
+        "streamLockForceTerminateWaitMs": 15000,
         "voice": {
             "enabled": true,
             "requireRecognition": true,

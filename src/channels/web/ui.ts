@@ -13,6 +13,8 @@ export function renderWebChatPage(config: WebConfig): string {
         title: config.title,
         wsPath: config.path,
         uiPath: config.uiPath,
+        sessionApiPath: '/api/web/sessions',
+        uploadApiPath: '/api/web/uploads',
         authRequired: Boolean(config.authToken?.trim()),
     });
 
@@ -488,6 +490,78 @@ export function renderWebChatPage(config: WebConfig): string {
       font-size: 15px;
       line-height: 1.6;
     }
+    .composer-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .composer-upload {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .button-ghost {
+      appearance: none;
+      border: 1px dashed rgba(23, 49, 58, 0.22);
+      background: rgba(255, 255, 255, 0.6);
+      color: var(--ink);
+      border-radius: 999px;
+      min-height: 42px;
+      padding: 0 16px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .button-ghost:hover {
+      background: rgba(255, 255, 255, 0.82);
+    }
+    .composer-files {
+      display: grid;
+      gap: 8px;
+    }
+    .composer-files.hidden {
+      display: none;
+    }
+    .composer-file-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(23, 49, 58, 0.1);
+      background: rgba(255, 255, 255, 0.6);
+    }
+    .composer-file-meta {
+      min-width: 0;
+      display: grid;
+      gap: 2px;
+    }
+    .composer-file-name {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--ink);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .composer-file-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .composer-file-remove {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 4px 6px;
+    }
     .composer-actions {
       display: flex;
       align-items: center;
@@ -598,6 +672,14 @@ export function renderWebChatPage(config: WebConfig): string {
 
       <form class="composer" id="composer">
         <textarea id="prompt-input" placeholder="例如：回顾一下今天的告警处理，并告诉我未完成项。"></textarea>
+        <div class="composer-toolbar">
+          <div class="composer-upload">
+            <input id="attachment-input" type="file" multiple class="hidden" />
+            <button class="button-ghost" id="attachment-button" type="button">上传图片/文件</button>
+            <div class="composer-tip">可直接发送图片、文本文件、PDF、压缩包等附件。</div>
+          </div>
+        </div>
+        <div class="composer-files hidden" id="composer-files"></div>
         <div class="composer-actions">
           <div class="composer-tip">Enter 发送，Shift + Enter 换行。</div>
           <button class="button-primary" id="send-button" type="submit">发送消息</button>
@@ -624,6 +706,9 @@ export function renderWebChatPage(config: WebConfig): string {
         messages: document.getElementById('messages'),
         emptyState: document.getElementById('empty-state'),
         promptInput: document.getElementById('prompt-input'),
+        attachmentInput: document.getElementById('attachment-input'),
+        attachmentButton: document.getElementById('attachment-button'),
+        composerFiles: document.getElementById('composer-files'),
         composer: document.getElementById('composer'),
         sendButton: document.getElementById('send-button'),
         reconnectButton: document.getElementById('reconnect-button'),
@@ -643,7 +728,8 @@ export function renderWebChatPage(config: WebConfig): string {
         isBusy: false,
         connectionId: '',
         pendingReplies: new Map(),
-        toolLabel: ''
+        toolLabel: '',
+        pendingUploads: []
       };
 
       function randomId(prefix) {
@@ -976,7 +1062,7 @@ export function renderWebChatPage(config: WebConfig): string {
         }
 
         attachments.forEach(function(attachment) {
-          if (!attachment || !attachment.url || !attachment.name) {
+          if (!attachment || !attachment.name) {
             return;
           }
 
@@ -996,13 +1082,20 @@ export function renderWebChatPage(config: WebConfig): string {
 
           meta.append(name, note);
 
-          var link = document.createElement('a');
-          link.className = 'attachment-link';
-          link.href = attachment.url;
-          link.download = attachment.name;
-          link.target = '_blank';
-          link.rel = 'noreferrer';
-          link.textContent = '下载';
+          var link;
+          if (attachment.url && attachment.url !== '#') {
+            link = document.createElement('a');
+            link.className = 'attachment-link';
+            link.href = attachment.url;
+            link.download = attachment.name;
+            link.target = '_blank';
+            link.rel = 'noreferrer';
+            link.textContent = '下载';
+          } else {
+            link = document.createElement('span');
+            link.className = 'attachment-link';
+            link.textContent = '已上传';
+          }
 
           card.append(meta, link);
           container.appendChild(card);
@@ -1013,6 +1106,96 @@ export function renderWebChatPage(config: WebConfig): string {
         } else {
           container.classList.add('hidden');
         }
+      }
+
+      function renderPendingUploads() {
+        els.composerFiles.innerHTML = '';
+        if (!Array.isArray(state.pendingUploads) || state.pendingUploads.length === 0) {
+          els.composerFiles.classList.add('hidden');
+          return;
+        }
+
+        state.pendingUploads.forEach(function(file, index) {
+          var card = document.createElement('div');
+          card.className = 'composer-file-card';
+
+          var meta = document.createElement('div');
+          meta.className = 'composer-file-meta';
+
+          var name = document.createElement('div');
+          name.className = 'composer-file-name';
+          name.textContent = file.name;
+
+          var note = document.createElement('div');
+          note.className = 'composer-file-note';
+          note.textContent = (file.type || 'application/octet-stream') + ' · ' + formatBytes(file.size || 0);
+
+          var removeButton = document.createElement('button');
+          removeButton.className = 'composer-file-remove';
+          removeButton.type = 'button';
+          removeButton.textContent = '移除';
+          removeButton.addEventListener('click', function() {
+            state.pendingUploads.splice(index, 1);
+            renderPendingUploads();
+            syncComposerState();
+          });
+
+          meta.append(name, note);
+          card.append(meta, removeButton);
+          els.composerFiles.appendChild(card);
+        });
+
+        els.composerFiles.classList.remove('hidden');
+      }
+
+      function appendPendingFiles(fileList) {
+        if (!fileList || fileList.length === 0) {
+          return;
+        }
+        for (var i = 0; i < fileList.length; i += 1) {
+          state.pendingUploads.push(fileList[i]);
+        }
+        renderPendingUploads();
+        syncComposerState();
+      }
+
+      function clearPendingFiles() {
+        state.pendingUploads = [];
+        if (els.attachmentInput) {
+          els.attachmentInput.value = '';
+        }
+        renderPendingUploads();
+      }
+
+      async function uploadPendingFiles() {
+        if (!Array.isArray(state.pendingUploads) || state.pendingUploads.length === 0) {
+          return [];
+        }
+
+        var formData = new FormData();
+        formData.append('user_id', els.userId.value.trim() || 'web-user');
+        if (els.conversationId.value.trim()) {
+          formData.append('session_id', els.conversationId.value.trim());
+        }
+        state.pendingUploads.forEach(function(file) {
+          formData.append('files', file, file.name);
+        });
+
+        var headers = {};
+        if (boot.authRequired && els.authToken.value) {
+          headers['authorization'] = 'Bearer ' + els.authToken.value;
+        }
+
+        var response = await fetch(boot.uploadApiPath, {
+          method: 'POST',
+          body: formData,
+          headers: headers,
+        });
+        var payload = await response.json().catch(function() { return {}; });
+        if (!response.ok || payload.ok === false) {
+          throw new Error((payload.error && payload.error.message) || '附件上传失败');
+        }
+        return Array.isArray(payload.uploads) ? payload.uploads : [];
       }
 
       function createMessage(role, label, initialText, options) {
@@ -1103,6 +1286,7 @@ export function renderWebChatPage(config: WebConfig): string {
         const disabled = !state.isConnected || state.isBusy;
         els.sendButton.disabled = disabled;
         els.promptInput.disabled = disabled;
+        els.attachmentButton.disabled = disabled;
       }
 
       function buildHelloPayload() {
@@ -1231,14 +1415,15 @@ export function renderWebChatPage(config: WebConfig): string {
         });
       }
 
-      function sendMessage() {
+      async function sendMessage() {
         if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
           appendSystem('当前未连接到服务端。');
           return;
         }
 
         const text = els.promptInput.value.trim();
-        if (!text || state.isBusy) {
+        const hasPendingUploads = Array.isArray(state.pendingUploads) && state.pendingUploads.length > 0;
+        if ((!text && !hasPendingUploads) || state.isBusy) {
           return;
         }
 
@@ -1246,25 +1431,48 @@ export function renderWebChatPage(config: WebConfig): string {
         const conversationId = els.conversationId.value.trim() || undefined;
         saveFields();
 
-        createMessage('user', 'you', text, { rich: false, attachments: [] });
-        ensureReplyBubble(sourceMessageId);
-
         state.isBusy = true;
         syncComposerState();
-        els.promptInput.value = '';
+        var uploads = [];
+        var userAttachments = [];
 
-        state.socket.send(JSON.stringify({
-          type: 'message',
-          message_id: sourceMessageId,
-          request_id: sourceMessageId,
-          idempotency_key: sourceMessageId,
-          session_id: conversationId,
-          session_title: boot.title,
-          isDirect: true,
-          user_id: els.userId.value.trim() || 'web-user',
-          nick_name: els.userName.value.trim() || 'Web User',
-          text
-        }));
+        try {
+          uploads = await uploadPendingFiles();
+          userAttachments = uploads.map(function(item) {
+            return {
+              name: item.name,
+              url: '#',
+              sizeBytes: item.sizeBytes,
+              mimeType: item.mimeType
+            };
+          });
+
+          createMessage('user', 'you', text || '（仅发送附件）', { rich: false, attachments: userAttachments });
+          ensureReplyBubble(sourceMessageId);
+
+          state.socket.send(JSON.stringify({
+            type: 'message',
+            message_id: sourceMessageId,
+            request_id: sourceMessageId,
+            idempotency_key: sourceMessageId,
+            session_id: conversationId,
+            session_title: boot.title,
+            isDirect: true,
+            user_id: els.userId.value.trim() || 'web-user',
+            nick_name: els.userName.value.trim() || 'Web User',
+            text,
+            attachments: uploads.map(function(item) {
+              return { upload_id: item.upload_id };
+            })
+          }));
+
+          els.promptInput.value = '';
+          clearPendingFiles();
+        } catch (error) {
+          appendSystem('附件上传失败：' + (error && error.message ? error.message : String(error)));
+          state.isBusy = false;
+          syncComposerState();
+        }
       }
 
       function resetConversation() {
@@ -1284,14 +1492,24 @@ export function renderWebChatPage(config: WebConfig): string {
 
       els.composer.addEventListener('submit', (event) => {
         event.preventDefault();
-        sendMessage();
+        void sendMessage();
       });
 
       els.promptInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();
-          sendMessage();
+          void sendMessage();
         }
+      });
+
+      els.attachmentButton.addEventListener('click', () => {
+        if (!els.attachmentInput.disabled) {
+          els.attachmentInput.click();
+        }
+      });
+
+      els.attachmentInput.addEventListener('change', () => {
+        appendPendingFiles(Array.from(els.attachmentInput.files || []));
       });
 
       [els.userName, els.userId, els.conversationId, els.authToken].forEach((input) => {
@@ -1319,6 +1537,7 @@ export function renderWebChatPage(config: WebConfig): string {
       setStatus('disconnected', '未连接');
       els.socketUrl.textContent = getSocketUrl();
       syncComposerState();
+      renderPendingUploads();
       connect();
       setInterval(() => {
         if (state.socket && state.socket.readyState === WebSocket.OPEN) {

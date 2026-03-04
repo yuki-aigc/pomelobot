@@ -471,6 +471,9 @@ MEMORY_PG_PASSWORD="xxx"
         "cardTemplateId": "",               // 消息卡片模板 ID
         "showThinking": true,               // 是否展示思考过程
         "debug": false,
+        "streamLockWaitMs": 120000,         // PG advisory lock 最长等待时间；K8s 重启时建议 >= terminationGracePeriodSeconds
+        "streamLockForceTerminateOnTimeout": false, // 超时后是否尝试 pg_terminate_backend() 抢回锁；单副本 K8s 可考虑开启
+        "streamLockForceTerminateWaitMs": 15000,    // 强制终止旧 backend 后，最多再等待多久完成接管
         "voice": {
             "enabled": true,                // 启用语音输入
             "requireRecognition": true,     // 要求钉钉识别文本，否则提示重试
@@ -668,9 +671,18 @@ CHANNELS=web pnpm run server
 - **流式打印**：浏览器接收 `reply_start / reply_delta / reply_final`
 - **Markdown 渲染**：助手回复支持标题、列表、引用、代码块等基础 Markdown
 - **代码高亮**：对 `ts/js/json/bash/sql/yaml` 等常见代码块做轻量高亮
+- **图片/文件上传**：内置 UI 和外部前端都可通过 `POST /api/web/uploads` 上传图片或文件，再在 `message.attachments[].upload_id` 中引用
+- **媒体理解**：入站图片会走视觉理解；文本类文件会抽取前缀内容写入 `[媒体上下文]`；非文本文件保留元信息供 Agent 参考
 - **附件回传**：Agent 可通过 `web_write_tmp_file / web_send_file` 生成并回传 `workspace/tmp` 下文件
 - **会话隔离**：按 `conversationId` 建立独立 thread，支持手动新开会话
 - **工具状态提示**：收到 `tool_start / tool_end` 时页面会显示当前工具状态
+
+### 对外 API 要点
+
+- `POST /api/web/sessions`：申请/恢复 `session_id`
+- `POST /api/web/uploads`：上传图片/文件，返回 `upload_id`
+- `WebSocket message.attachments[].upload_id`：把已上传附件挂到本轮消息
+- 详细协议见 `docs/web-api.md`
 
 ## 容器部署
 

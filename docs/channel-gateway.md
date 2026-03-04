@@ -53,8 +53,9 @@
 - 能力：
   - 内置 HTTP Server + WS Server，同端口托管 UI 和对话通道
   - 支持 `hello` / `message` / `ping` 协议
+  - 支持 `POST /api/web/uploads` 上传图片/文件，并在 `message.attachments[].upload_id` 中引用
   - 浏览器流式事件：`reply_start` / `reply_delta` / `reply_final`
-  - UI 侧支持基础 Markdown 渲染、代码块高亮、附件下载
+  - UI 侧支持基础 Markdown 渲染、代码块高亮、附件上传、附件下载
   - `sendReply` / `sendProactive` 同样支持按连接、会话、用户路由
 
 ### 2.6 Cron 渠道隔离（新增）

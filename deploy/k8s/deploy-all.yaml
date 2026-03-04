@@ -43,17 +43,17 @@ spec:
           image: deepagents-srebot:latest
           imagePullPolicy: IfNotPresent
           command: ["node", "dist/server.js"]
-          # lifecycle:
-          #   preStop:
-          #     exec:
-          #       command:
-          #         - /bin/sh
-          #         - -c
-          #         - >
-          #           echo "[preStop] send SIGTERM to pid 1";
-          #           kill -TERM 1 2>/dev/null || true;
-          #           echo "[preStop] sleeping 10s for graceful stream disconnect";
-          #           sleep 10
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >
+                    echo "[preStop] send SIGTERM to pid 1";
+                    kill -TERM 1 2>/dev/null || true;
+                    echo "[preStop] sleeping 20s for graceful stream disconnect and memory flush";
+                    sleep 20
           volumeMounts:
             # 挂载配置文件
             - name: config-volume
@@ -192,6 +192,9 @@ stringData:
         "cardTemplateId": "REPLACE_ME",
         "showThinking": false,
         "debug": false,
+        "streamLockWaitMs": 120000,
+        "streamLockForceTerminateOnTimeout": true,
+        "streamLockForceTerminateWaitMs": 15000,
         "voice": {
           "enabled": true,
           "requireRecognition": true,

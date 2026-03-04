@@ -2,12 +2,14 @@ import { createServer, type IncomingMessage, type Server as HTTPServer, type Ser
 import { randomUUID } from 'node:crypto';
 import { createReadStream, promises as fsPromises } from 'node:fs';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import type { WebConfig } from '../../config.js';
 import type {
     ChannelAdapter,
     ChannelAdapterRuntime,
+    ChannelAttachment,
     ChannelInboundMessage,
     ChannelProactiveRequest,
     ChannelReplyRequest,
@@ -20,12 +22,16 @@ import {
     resolveMessageIdentity,
 } from './api.js';
 import {
+    MAX_WEB_UPLOAD_FILES,
+    MAX_WEB_UPLOAD_FILE_BYTES,
     MAX_WEB_REPLY_FILE_BYTES,
     buildAttachmentBasePath,
     buildContentDisposition,
+    detectWebMediaType,
     guessMimeType,
     isPathInsideDir,
     resolvePathFromWorkspace,
+    sanitizeFileName,
 } from './file-utils.js';
 import type {
     WebAttachmentPayload,
@@ -33,9 +39,12 @@ import type {
     WebClientEnvelope,
     WebConnectionState,
     WebHelloPayload,
+    WebInboundAttachmentPayload,
     WebLogger,
     WebMessagePayload,
     WebServerEnvelope,
+    WebUploadedAttachmentPayload,
+    WebUploadRecord,
 } from './types.js';
 
 export interface WebChannelAdapterOptions {
@@ -51,6 +60,7 @@ export interface WebStreamRequest {
 
 const ATTACHMENT_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_API_PATH = '/api/web/sessions';
+const UPLOAD_API_PATH = '/api/web/uploads';
 
 function parseClientEnvelope(raw: RawData): WebClientEnvelope | null {
     let text = '';
@@ -108,6 +118,7 @@ export class WebChannelAdapter implements ChannelAdapter {
     private readonly conversationIndex = new Map<string, Set<string>>();
     private readonly userIndex = new Map<string, Set<string>>();
     private readonly attachmentRegistry = new Map<string, WebAttachmentRecord>();
+    private readonly uploadRegistry = new Map<string, WebUploadRecord>();
     private readonly sessionRegistry = new WebSessionRegistry();
 
     constructor(private readonly options: WebChannelAdapterOptions) {}
@@ -190,6 +201,7 @@ export class WebChannelAdapter implements ChannelAdapter {
         this.conversationIndex.clear();
         this.userIndex.clear();
         this.attachmentRegistry.clear();
+        this.uploadRegistry.clear();
         this.sessionRegistry.clear();
         this.runtime = null;
         this.options.log.info('[WebAdapter] stopped');
@@ -337,7 +349,7 @@ export class WebChannelAdapter implements ChannelAdapter {
         const method = req.method || 'GET';
         const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const attachmentBasePath = buildAttachmentBasePath(uiPath);
-        if (method === 'OPTIONS' && url.pathname === SESSION_API_PATH) {
+        if (method === 'OPTIONS' && (url.pathname === SESSION_API_PATH || url.pathname === UPLOAD_API_PATH)) {
             this.writeApiCorsHeaders(res);
             res.writeHead(204);
             res.end();
@@ -351,6 +363,11 @@ export class WebChannelAdapter implements ChannelAdapter {
 
         if (method === 'POST' && url.pathname === SESSION_API_PATH) {
             await this.handleCreateSessionRequest(req, res);
+            return;
+        }
+
+        if (method === 'POST' && url.pathname === UPLOAD_API_PATH) {
+            await this.handleUploadRequest(req, res);
             return;
         }
 
@@ -505,6 +522,234 @@ export class WebChannelAdapter implements ChannelAdapter {
                 },
             }));
         }
+    }
+
+    private async handleUploadRequest(
+        req: IncomingMessage,
+        res: ServerResponse,
+    ): Promise<void> {
+        try {
+            const parsed = await this.readUploadRequest(req);
+            if (parsed.files.length === 0) {
+                throw new Error('至少上传一个文件');
+            }
+            if (parsed.files.length > MAX_WEB_UPLOAD_FILES) {
+                throw new Error(`单次最多上传 ${MAX_WEB_UPLOAD_FILES} 个文件`);
+            }
+
+            const uploads: WebUploadedAttachmentPayload[] = [];
+            for (const file of parsed.files) {
+                if (!file.name.trim()) {
+                    throw new Error('上传文件名不能为空');
+                }
+                if (file.sizeBytes <= 0) {
+                    throw new Error(`文件为空: ${file.name}`);
+                }
+                if (file.sizeBytes > MAX_WEB_UPLOAD_FILE_BYTES) {
+                    throw new Error(`文件超过 ${Math.floor(MAX_WEB_UPLOAD_FILE_BYTES / 1024 / 1024)}MB 限制: ${file.name}`);
+                }
+                uploads.push(await this.registerInboundUpload({
+                    userId: parsed.userId,
+                    sessionId: parsed.sessionId,
+                    name: file.name,
+                    mimeType: file.mimeType,
+                    buffer: file.buffer,
+                }));
+            }
+
+            this.writeApiCorsHeaders(res);
+            res.writeHead(201, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                ok: true,
+                uploads,
+            }));
+        } catch (error) {
+            this.writeApiCorsHeaders(res);
+            res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                ok: false,
+                error: {
+                    code: 'bad_request',
+                    message: error instanceof Error ? error.message : String(error),
+                },
+            }));
+        }
+    }
+
+    private async readUploadRequest(req: IncomingMessage): Promise<{
+        userId?: string;
+        sessionId?: string;
+        files: Array<{ name: string; mimeType: string; sizeBytes: number; buffer: Buffer }>;
+    }> {
+        const contentType = (req.headers['content-type'] || '').toLowerCase();
+        if (contentType.includes('multipart/form-data')) {
+            return this.readMultipartUploadBody(req);
+        }
+
+        const body = await this.readJsonBody(req, 32 * 1024 * 1024);
+        const userId = tryTrim(body.user_id) || tryTrim(body.userId);
+        const sessionId = tryTrim(body.session_id) || tryTrim(body.sessionId);
+        const rawFiles = Array.isArray(body.files) ? body.files : [];
+        const files: Array<{ name: string; mimeType: string; sizeBytes: number; buffer: Buffer }> = [];
+
+        for (const item of rawFiles) {
+            if (!item || typeof item !== 'object') {
+                continue;
+            }
+            const file = item as Record<string, unknown>;
+            const fileName = tryTrim(file.name) || 'upload.bin';
+            const mimeType = tryTrim(file.mime_type) || tryTrim(file.mimeType) || guessMimeType(fileName);
+            const base64 = tryTrim(file.content_base64) || tryTrim(file.contentBase64);
+            if (!base64) {
+                throw new Error(`文件缺少 content_base64: ${fileName}`);
+            }
+            const buffer = Buffer.from(base64, 'base64');
+            if (buffer.length === 0) {
+                throw new Error(`文件内容为空或 base64 非法: ${fileName}`);
+            }
+            files.push({
+                name: fileName,
+                mimeType,
+                sizeBytes: buffer.length,
+                buffer,
+            });
+        }
+
+        return { userId, sessionId, files };
+    }
+
+    private async readMultipartUploadBody(req: IncomingMessage): Promise<{
+        userId?: string;
+        sessionId?: string;
+        files: Array<{ name: string; mimeType: string; sizeBytes: number; buffer: Buffer }>;
+    }> {
+        const url = new URL(req.url || UPLOAD_API_PATH, `http://${req.headers.host || 'localhost'}`);
+        const request = new Request(url, {
+            method: req.method || 'POST',
+            headers: req.headers as Record<string, string | string[]>,
+            body: Readable.toWeb(req) as ReadableStream,
+            duplex: 'half',
+        });
+        const formData = await request.formData();
+        const userId = tryTrim(formData.get('user_id')) || tryTrim(formData.get('userId'));
+        const sessionId = tryTrim(formData.get('session_id')) || tryTrim(formData.get('sessionId'));
+        const files: Array<{ name: string; mimeType: string; sizeBytes: number; buffer: Buffer }> = [];
+
+        for (const [key, value] of formData.entries()) {
+            if (!(key === 'file' || key === 'files')) {
+                continue;
+            }
+            if (!(value instanceof File)) {
+                continue;
+            }
+            const arrayBuffer = await value.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            files.push({
+                name: value.name || 'upload.bin',
+                mimeType: value.type || guessMimeType(value.name || 'upload.bin'),
+                sizeBytes: buffer.length,
+                buffer,
+            });
+        }
+
+        return { userId, sessionId, files };
+    }
+
+    private async registerInboundUpload(params: {
+        userId?: string;
+        sessionId?: string;
+        name: string;
+        mimeType?: string;
+        buffer: Buffer;
+    }): Promise<WebUploadedAttachmentPayload> {
+        this.cleanupExpiredUploads();
+        const uploadId = `upl_${randomUUID().replace(/-/g, '')}`;
+        const safeName = sanitizeFileName(params.name);
+        const uploadRoot = path.resolve(this.options.workspaceRoot, 'tmp', 'web-uploads');
+        const datedDir = new Date().toISOString().slice(0, 10);
+        const targetDir = path.join(uploadRoot, datedDir);
+        await fsPromises.mkdir(targetDir, { recursive: true });
+
+        const targetPath = path.join(targetDir, `${uploadId}-${safeName}`);
+        await fsPromises.writeFile(targetPath, params.buffer);
+
+        const mimeType = (params.mimeType || guessMimeType(safeName)).trim() || guessMimeType(safeName);
+        const mediaType = detectWebMediaType(safeName, mimeType);
+        const record: WebUploadRecord = {
+            id: uploadId,
+            name: safeName,
+            path: targetPath,
+            sizeBytes: params.buffer.length,
+            mimeType,
+            mediaType,
+            createdAt: Date.now(),
+            expiresAt: Date.now() + ATTACHMENT_TTL_MS,
+            userId: params.userId?.trim() || undefined,
+            sessionId: params.sessionId?.trim() || undefined,
+        };
+        this.uploadRegistry.set(uploadId, record);
+        return {
+            upload_id: record.id,
+            uploadId: record.id,
+            name: record.name,
+            sizeBytes: record.sizeBytes,
+            mimeType: record.mimeType,
+            mime_type: record.mimeType,
+            mediaType: record.mediaType,
+            media_type: record.mediaType,
+        };
+    }
+
+    private resolveInboundAttachments(
+        attachments: WebInboundAttachmentPayload[] | undefined,
+        identity: { userId: string; sessionId: string },
+    ): ChannelAttachment[] {
+        this.cleanupExpiredUploads();
+        if (!Array.isArray(attachments) || attachments.length === 0) {
+            return [];
+        }
+
+        const resolved: ChannelAttachment[] = [];
+        const seen = new Set<string>();
+        for (const item of attachments) {
+            const uploadId = tryTrim(item?.upload_id) || tryTrim(item?.uploadId);
+            if (!uploadId) {
+                throw new Error('attachments[].upload_id 不能为空');
+            }
+            if (seen.has(uploadId)) {
+                continue;
+            }
+            seen.add(uploadId);
+
+            const record = this.uploadRegistry.get(uploadId);
+            if (!record || record.expiresAt <= Date.now()) {
+                this.uploadRegistry.delete(uploadId);
+                throw new Error(`附件不存在或已过期: ${uploadId}`);
+            }
+            if (record.userId && record.userId !== identity.userId) {
+                throw new Error(`附件 ${uploadId} 不属于当前 user_id`);
+            }
+            if (record.sessionId && record.sessionId !== identity.sessionId) {
+                throw new Error(`附件 ${uploadId} 不属于当前 session_id`);
+            }
+
+            resolved.push({
+                name: record.name,
+                path: record.path,
+                mimeType: record.mimeType,
+                metadata: {
+                    uploadId: record.id,
+                    mediaType: record.mediaType,
+                    sizeBytes: record.sizeBytes,
+                    source: 'web_upload',
+                },
+            });
+        }
+
+        return resolved;
     }
 
     private hasAuthToken(): boolean {
@@ -664,6 +909,7 @@ export class WebChannelAdapter implements ChannelAdapter {
             session_title: state.conversationTitle,
             conversationTitle: state.conversationTitle,
             api_path: SESSION_API_PATH,
+            upload_api_path: UPLOAD_API_PATH,
             serverTime: Date.now(),
         });
     }
@@ -673,12 +919,13 @@ export class WebChannelAdapter implements ChannelAdapter {
             throw new Error('Web adapter runtime is not ready');
         }
 
-        const text = payload.text?.trim();
-        if (!text) {
+        const text = payload.text?.trim() || '';
+        const hasAttachments = Array.isArray(payload.attachments) && payload.attachments.length > 0;
+        if (!text && !hasAttachments) {
             this.sendToConnection(state, {
                 type: 'error',
                 code: 'empty_text',
-                message: 'message.text 不能为空',
+                message: 'message.text 不能为空；如果只发附件，请同时传 attachments',
             });
             return;
         }
@@ -713,6 +960,27 @@ export class WebChannelAdapter implements ChannelAdapter {
         state.userName = identity.nickName;
         state.isDirect = identity.isDirect;
         this.reindexConnection(state, previousConversation, previousUser);
+        let inboundAttachments: ChannelAttachment[] = [];
+        try {
+            inboundAttachments = this.resolveInboundAttachments(payload.attachments, {
+                userId: state.userId || identity.userId,
+                sessionId: state.conversationId,
+            });
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            this.sendToConnection(state, {
+                type: 'dispatch_ack',
+                messageId: identity.messageId,
+                message_id: identity.messageId,
+                request_id: identity.messageId,
+                status: 'error',
+                reason,
+                session_id: state.conversationId,
+                sessionId: state.conversationId,
+                timestamp: Date.now(),
+            });
+            return;
+        }
         const inbound: ChannelInboundMessage = {
             channel: 'web',
             messageId: identity.messageId,
@@ -724,13 +992,15 @@ export class WebChannelAdapter implements ChannelAdapter {
             senderId: state.userId || `web-user-${state.connectionId}`,
             senderName: state.userName || 'Web User',
             text,
-            messageType: 'text',
+            messageType: inboundAttachments.length > 0 ? (text ? 'mixed' : 'attachment') : 'text',
+            attachments: inboundAttachments,
             workspaceRoot: this.options.workspaceRoot,
             metadata: {
                 webConnectionId: state.connectionId,
                 webClientId: state.clientId,
                 webUserId: state.userId,
                 webSessionId: state.conversationId,
+                webAttachmentCount: inboundAttachments.length,
                 webUserAgent: state.request.headers['user-agent'] || '',
                 webOrigin: state.request.headers.origin || '',
                 ...(payload.metadata || {}),
@@ -926,13 +1196,22 @@ export class WebChannelAdapter implements ChannelAdapter {
         }
     }
 
-    private async readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+    private cleanupExpiredUploads(now: number = Date.now()): void {
+        for (const [id, record] of this.uploadRegistry.entries()) {
+            if (record.expiresAt <= now) {
+                this.uploadRegistry.delete(id);
+            }
+        }
+    }
+
+    private async readJsonBody(req: IncomingMessage, maxBytes: number = 64 * 1024): Promise<Record<string, unknown>> {
         const chunks: Buffer[] = [];
+        let currentSize = 0;
         for await (const chunk of req) {
             const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
             chunks.push(buffer);
-            const currentSize = chunks.reduce((sum, item) => sum + item.length, 0);
-            if (currentSize > 64 * 1024) {
+            currentSize += buffer.length;
+            if (currentSize > maxBytes) {
                 throw new Error('请求体过大');
             }
         }
@@ -949,8 +1228,8 @@ export class WebChannelAdapter implements ChannelAdapter {
 
     private writeApiCorsHeaders(res: ServerResponse): void {
         res.setHeader('access-control-allow-origin', '*');
-        res.setHeader('access-control-allow-methods', 'POST, OPTIONS');
-        res.setHeader('access-control-allow-headers', 'content-type, authorization');
+        res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+        res.setHeader('access-control-allow-headers', 'content-type, authorization, x-web-auth-token');
     }
 }
 

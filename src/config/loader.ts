@@ -119,6 +119,50 @@ function normalizeWebConfig(input?: Partial<WebConfig>): WebConfig | undefined {
     };
 }
 
+function normalizeDingTalkConfig(input?: Partial<DingTalkConfig>): DingTalkConfig | undefined {
+    if (!input) return undefined;
+
+    const defaultDingTalk = DEFAULT_CONFIG.dingtalk;
+    if (!defaultDingTalk) {
+        throw new Error('DEFAULT_CONFIG.dingtalk is not configured');
+    }
+
+    const rawStreamLockWait = Number(input.streamLockWaitMs);
+    const rawStreamLockForceTerminateWait = Number(input.streamLockForceTerminateWaitMs);
+
+    return {
+        ...defaultDingTalk,
+        ...input,
+        clientId: input.clientId?.trim() || defaultDingTalk.clientId,
+        clientSecret: input.clientSecret?.trim() || defaultDingTalk.clientSecret,
+        robotCode: input.robotCode?.trim() || undefined,
+        corpId: input.corpId?.trim() || undefined,
+        agentId: input.agentId?.trim() || undefined,
+        cardTemplateId: input.cardTemplateId?.trim() || undefined,
+        streamLockWaitMs: Number.isFinite(rawStreamLockWait) && rawStreamLockWait > 0
+            ? Math.floor(rawStreamLockWait)
+            : defaultDingTalk.streamLockWaitMs,
+        streamLockForceTerminateOnTimeout: input.streamLockForceTerminateOnTimeout
+            ?? defaultDingTalk.streamLockForceTerminateOnTimeout,
+        streamLockForceTerminateWaitMs: Number.isFinite(rawStreamLockForceTerminateWait) && rawStreamLockForceTerminateWait > 0
+            ? Math.floor(rawStreamLockForceTerminateWait)
+            : defaultDingTalk.streamLockForceTerminateWaitMs,
+        execApprovals: input.execApprovals
+            ? {
+                ...input.execApprovals,
+                templateId: input.execApprovals.templateId?.trim() || undefined,
+            }
+            : undefined,
+        cron: input.cron
+            ? {
+                ...input.cron,
+                defaultTarget: input.cron.defaultTarget?.trim() || undefined,
+                title: input.cron.title?.trim() || undefined,
+            }
+            : undefined,
+    };
+}
+
 function normalizeModel(
     raw: Partial<LLMModelConfig> & { alias?: string; provider?: LLMProvider },
     legacyOpenAI: OpenAIConfig,
@@ -492,7 +536,7 @@ export function loadConfig(): Config {
             runLog: fileConfig.cron?.runLog || DEFAULT_CONFIG.cron.runLog,
             timezone: fileConfig.cron?.timezone || DEFAULT_CONFIG.cron.timezone,
         },
-        dingtalk: fileConfig.dingtalk as DingTalkConfig | undefined,
+        dingtalk: normalizeDingTalkConfig(fileConfig.dingtalk),
         ios: normalizeIOSConfig(fileConfig.ios),
         web: normalizeWebConfig(fileConfig.web),
     };

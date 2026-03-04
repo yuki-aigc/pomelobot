@@ -7,7 +7,7 @@
 当前设计采用：
 
 - WebSocket：承载实时对话和流式回复
-- HTTP：承载健康检查、会话创建、附件下载、内置调试 UI
+- HTTP：承载健康检查、会话创建、上传接口、附件下载、内置调试 UI
 
 ## 2. 设计结论
 
@@ -140,7 +140,77 @@ Content-Type: application/json
 - 该接口支持 `CORS`
 - 如果你不想单独走 HTTP，也可以直接在 WebSocket `hello` 时让服务端生成 `session_id`
 
-### 3.3 记忆持久化行为
+### 3.3 上传图片和文件
+
+`POST /api/web/uploads`
+
+支持两种调用方式：
+
+- `multipart/form-data`
+- `application/json` + base64
+
+推荐 `multipart/form-data`。
+
+请求字段：
+
+- `files` / `file`：一个或多个文件
+- `user_id`：可选，建议传
+- `session_id`：可选；如果传了，后续该附件只能被同一个 `session_id` 使用
+
+`multipart/form-data` 示例：
+
+```bash
+curl -X POST "http://127.0.0.1:18081/api/web/uploads" \
+  -F "user_id=u_1001" \
+  -F "session_id=wsn_xxx" \
+  -F "files=@./diagram.png" \
+  -F "files=@./runbook.md"
+```
+
+JSON 示例：
+
+```json
+{
+  "user_id": "u_1001",
+  "session_id": "wsn_xxx",
+  "files": [
+    {
+      "name": "runbook.md",
+      "mime_type": "text/markdown; charset=utf-8",
+      "content_base64": "IyBSdW5ib29rCi4uLg=="
+    }
+  ]
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "uploads": [
+    {
+      "upload_id": "upl_123",
+      "uploadId": "upl_123",
+      "name": "diagram.png",
+      "sizeBytes": 120394,
+      "mimeType": "image/png",
+      "mime_type": "image/png",
+      "mediaType": "image",
+      "media_type": "image"
+    }
+  ]
+}
+```
+
+说明：
+
+- 单次最多 `5` 个文件
+- 单文件默认限制 `20MB`
+- 上传成功后，需要在 WebSocket `message.attachments[].upload_id` 中引用
+- 内置 Web UI 发送附件时，走的也是这套接口
+
+### 3.4 记忆持久化行为
 
 Web 渠道当前默认会做三层持久化：
 
@@ -154,7 +224,7 @@ Web 渠道当前默认会做三层持久化：
 - 关键信息会通过 `memory_save` 进入长期检索链路
 - 多用户 Web API 现在默认共享 `main` scope，适合团队共享记忆
 
-### 3.4 附件下载
+### 3.5 附件下载
 
 服务端会在回复事件里返回附件列表：
 
@@ -234,6 +304,11 @@ ws://<host>:18081/ws/web
   "session_id": "wsn_5c9d7f1e9d4b4f73a49a5f1e4305a4ae",
   "session_title": "工单排障",
   "text": "帮我总结今天的异常处理",
+  "attachments": [
+    {
+      "upload_id": "upl_123"
+    }
+  ],
   "metadata": {
     "page": "support-console"
   }
@@ -245,6 +320,8 @@ ws://<host>:18081/ws/web
 - `message_id` 和 `request_id` 传同一个值即可
 - `idempotency_key` 建议与 `message_id` 一致
 - 如果连接已通过 `hello` 绑定过 `session_id`，`message.session_id` 可省略
+- 如果只发图片/文件，`text` 可以为空，但 `attachments` 不能为空
+- `attachments` 当前只接受上传接口返回的 `upload_id`
 
 #### `ping`
 
@@ -285,6 +362,7 @@ ws://<host>:18081/ws/web
   "session_id": "wsn_5c9d7f1e9d4b4f73a49a5f1e4305a4ae",
   "session_title": "工单排障",
   "api_path": "/api/web/sessions",
+  "upload_api_path": "/api/web/uploads",
   "authenticated": true,
   "serverTime": 1772580000000
 }
@@ -294,6 +372,7 @@ ws://<host>:18081/ws/web
 
 - `session_id` 一定要缓存下来
 - 后续续聊时传回这个值
+- `upload_api_path` 可直接给外部前端做上传入口
 
 #### `dispatch_ack`
 
@@ -447,6 +526,7 @@ ws://<host>:18081/ws/web
 
 - 当前会话模型是“单用户私有会话”，不是群聊共享会话
 - 跨用户复用同一个 `session_id` 会被拒绝
+- 入站附件需要先上传，再通过 `upload_id` 引用
 - 附件回传只支持 `workspace/tmp` 下被显式登记的文件
 - 当前没有独立用户鉴权体系，`user_id` 的真实性依赖上游调用方保证
 
