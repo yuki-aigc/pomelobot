@@ -125,6 +125,17 @@ export const DEFAULT_CONFIG: Config = {
         timezone: DEFAULT_TIMEZONE,
         runLog: './workspace/cron/runs.jsonl',
     },
+    dingtalk: {
+        enabled: false,
+        clientId: '',
+        clientSecret: '',
+        messageType: 'card',
+        showThinking: true,
+        debug: false,
+        streamLockWaitMs: 120000,
+        streamLockForceTerminateOnTimeout: false,
+        streamLockForceTerminateWaitMs: 15000,
+    },
     ios: {
         enabled: false,
         host: '0.0.0.0',

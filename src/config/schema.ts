@@ -162,6 +162,9 @@ const configSchemaInternal = z.object({
         cardTemplateId: z.string().optional(),
         showThinking: z.boolean().optional(),
         debug: z.boolean().optional(),
+        streamLockWaitMs: z.number().int().positive().optional(),
+        streamLockForceTerminateOnTimeout: z.boolean().optional(),
+        streamLockForceTerminateWaitMs: z.number().int().positive().optional(),
         execApprovals: z.object({
             enabled: z.boolean().optional(),
             timeoutMs: z.number().int().positive().optional(),

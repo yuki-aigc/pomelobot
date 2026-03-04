@@ -208,6 +208,9 @@ export interface DingTalkConfig {
     cardTemplateId?: string;
     showThinking?: boolean;
     debug?: boolean;
+    streamLockWaitMs?: number;
+    streamLockForceTerminateOnTimeout?: boolean;
+    streamLockForceTerminateWaitMs?: number;
     execApprovals?: {
         enabled?: boolean;
         timeoutMs?: number;

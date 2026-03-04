@@ -28,6 +28,12 @@ test('default config keeps non-web direct isolated but web direct shared', () =>
     assert.equal(DEFAULT_CONFIG.agent.memory.session_isolation.web_direct_scope, 'main');
 });
 
+test('default config sets dingtalk stream lock wait above common k8s grace periods', () => {
+    assert.equal(DEFAULT_CONFIG.dingtalk?.streamLockWaitMs, 120000);
+    assert.equal(DEFAULT_CONFIG.dingtalk?.streamLockForceTerminateOnTimeout, false);
+    assert.equal(DEFAULT_CONFIG.dingtalk?.streamLockForceTerminateWaitMs, 15000);
+});
+
 test('validateConfig reports path for invalid provider', () => {
     const config = buildValidConfig() as unknown as {
         llm: {

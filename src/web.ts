@@ -21,6 +21,7 @@ import {
 } from './middleware/index.js';
 import { resolveMemoryScope } from './middleware/memory-scope.js';
 import { consumeQueuedWebReplyFiles } from './channels/web/context.js';
+import { buildAttachmentMediaContext } from './channels/media-context.js';
 import {
     createRuntimeConsoleLogger,
     printChannelHeader,
@@ -43,6 +44,21 @@ const conversationQueue = new Map<string, Promise<void>>();
 interface WebConversationRuntimeState {
     threadId: string;
     flushState: MemoryFlushState;
+}
+
+function composeInboundWebText(text: string, mediaContext: string | null): string {
+    const normalizedText = text.trim();
+    const normalizedMedia = mediaContext?.trim() || '';
+    if (normalizedText && normalizedMedia) {
+        return `${normalizedText}\n\n${normalizedMedia}`;
+    }
+    if (normalizedText) {
+        return normalizedText;
+    }
+    if (normalizedMedia) {
+        return `请结合以下附件内容进行处理。\n\n${normalizedMedia}`;
+    }
+    return '';
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
@@ -295,7 +311,12 @@ export async function startWebService(options?: {
             }
 
             await enqueueConversationTask(message.conversationId, async () => {
-                const userText = message.text.trim();
+                const mediaContext = await buildAttachmentMediaContext({
+                    config,
+                    attachments: message.attachments || [],
+                    log,
+                });
+                const userText = composeInboundWebText(message.text, mediaContext);
                 if (!userText) {
                     await adapter.sendStreamEvent({
                         inbound: message,
@@ -328,6 +349,7 @@ export async function startWebService(options?: {
                     metadata: {
                         scopeKey: scope.key,
                         direction: 'inbound',
+                        attachmentCount: message.attachments?.length || 0,
                     },
                 });
                 conversationState.flushState = await updateTokenCountWithModel(

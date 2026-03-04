@@ -1,6 +1,8 @@
 import path from 'node:path';
 
 export const MAX_WEB_REPLY_FILE_BYTES = 25 * 1024 * 1024;
+export const MAX_WEB_UPLOAD_FILE_BYTES = 20 * 1024 * 1024;
+export const MAX_WEB_UPLOAD_FILES = 5;
 
 const MIME_BY_EXTENSION: Record<string, string> = {
     '.csv': 'text/csv; charset=utf-8',
@@ -70,4 +72,16 @@ export function buildContentDisposition(fileName: string): string {
     const asciiFallback = fileName.replace(/[^\x20-\x7e]+/g, '_').replace(/["\\]/g, '_') || 'download';
     const encoded = encodeURIComponent(fileName);
     return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
+export function detectWebMediaType(fileName: string, mimeType?: string): 'image' | 'file' {
+    const normalizedMime = mimeType?.toLowerCase().trim() || '';
+    if (normalizedMime.startsWith('image/')) {
+        return 'image';
+    }
+    const normalizedName = fileName.toLowerCase();
+    if (/\.(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(normalizedName)) {
+        return 'image';
+    }
+    return 'file';
 }
