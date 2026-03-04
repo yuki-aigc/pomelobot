@@ -244,6 +244,19 @@ export interface IOSConfig {
     };
 }
 
+export interface WebConfig {
+    enabled: boolean;
+    host: string;
+    port: number;
+    path: string;
+    uiPath: string;
+    title: string;
+    authToken?: string;
+    debug?: boolean;
+    maxPayloadBytes?: number;
+    pingIntervalMs?: number;
+}
+
 export interface CronConfig {
     enabled: boolean;
     store: string;
@@ -259,6 +272,7 @@ export interface Config {
     cron: CronConfig;
     dingtalk?: DingTalkConfig;
     ios?: IOSConfig;
+    web?: WebConfig;
 }
 
 export interface RawConfigFile {
@@ -287,4 +301,5 @@ export interface RawConfigFile {
     cron?: Partial<CronConfig>;
     dingtalk?: Partial<DingTalkConfig>;
     ios?: Partial<IOSConfig>;
+    web?: Partial<WebConfig>;
 }

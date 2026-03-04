@@ -8,6 +8,7 @@ import {
     type ExecCommandsFile,
     type ExecConfigFile,
     type IOSConfig,
+    type WebConfig,
     type LLMModelConfig,
     type LLMProvider,
     type OpenAIConfig,
@@ -83,6 +84,38 @@ function normalizeIOSConfig(input?: Partial<IOSConfig>): IOSConfig | undefined {
                 runLog: input.cron.runLog?.trim() || undefined,
             }
             : undefined,
+    };
+}
+
+function normalizeWebConfig(input?: Partial<WebConfig>): WebConfig | undefined {
+    if (!input) return undefined;
+
+    const defaultWeb = DEFAULT_CONFIG.web;
+    if (!defaultWeb) {
+        throw new Error('DEFAULT_CONFIG.web is not configured');
+    }
+
+    const rawPort = Number(input.port);
+    const rawMaxPayload = Number(input.maxPayloadBytes);
+    const rawPingInterval = Number(input.pingIntervalMs);
+
+    return {
+        enabled: input.enabled ?? defaultWeb.enabled,
+        host: input.host?.trim() || defaultWeb.host,
+        port: Number.isFinite(rawPort) && rawPort > 0
+            ? Math.floor(rawPort)
+            : defaultWeb.port,
+        path: input.path?.trim() || defaultWeb.path,
+        uiPath: input.uiPath?.trim() || defaultWeb.uiPath,
+        title: input.title?.trim() || defaultWeb.title,
+        authToken: input.authToken?.trim() || undefined,
+        debug: input.debug ?? defaultWeb.debug,
+        maxPayloadBytes: Number.isFinite(rawMaxPayload) && rawMaxPayload > 0
+            ? Math.floor(rawMaxPayload)
+            : defaultWeb.maxPayloadBytes,
+        pingIntervalMs: Number.isFinite(rawPingInterval) && rawPingInterval >= 0
+            ? Math.floor(rawPingInterval)
+            : defaultWeb.pingIntervalMs,
     };
 }
 
@@ -461,6 +494,7 @@ export function loadConfig(): Config {
         },
         dingtalk: fileConfig.dingtalk as DingTalkConfig | undefined,
         ios: normalizeIOSConfig(fileConfig.ios),
+        web: normalizeWebConfig(fileConfig.web),
     };
 
     const parsedModels: LLMModelConfig[] = [];
