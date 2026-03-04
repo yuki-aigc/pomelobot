@@ -133,4 +133,15 @@ export const DEFAULT_CONFIG: Config = {
         maxPayloadBytes: 1024 * 1024,
         pingIntervalMs: 30000,
     },
+    web: {
+        enabled: false,
+        host: '0.0.0.0',
+        port: 18081,
+        path: '/ws/web',
+        uiPath: '/web',
+        title: 'Pomelobot Web',
+        debug: false,
+        maxPayloadBytes: 1024 * 1024,
+        pingIntervalMs: 30000,
+    },
 };

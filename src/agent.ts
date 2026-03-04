@@ -18,6 +18,7 @@ import { initializeMCPTools } from './mcp.js';
 import { createChatModel } from './llm.js';
 import { createCronTools } from './cron/tools.js';
 import { createDingTalkFileReturnTools } from './channels/dingtalk/file-return-tools.js';
+import { createWebFileReturnTools } from './channels/web/file-return-tools.js';
 import {
     buildEnvWithCredentialFallback,
     enterTemporaryCredentialEnv,
@@ -408,6 +409,7 @@ export async function createSREAgent(
     const execApprovalPrompt = options?.execApprovalPrompt;
     const runtimeChannel = options?.runtimeChannel || 'cli';
     const enableDingTalkTools = runtimeChannel === 'dingtalk';
+    const enableWebTools = runtimeChannel === 'web';
     const workspacePath = resolve(process.cwd(), cfg.agent.workspace);
     const skillsPath = resolve(process.cwd(), cfg.agent.skills_dir);
 
@@ -441,9 +443,20 @@ export async function createSREAgent(
     const dingtalkFileTools = enableDingTalkTools
         ? createDingTalkFileReturnTools(workspacePath, cfg.dingtalk, dingtalkToolLogger)
         : [];
+    const webToolLogger = enableWebTools
+        ? {
+            debug: (message: string, ...args: unknown[]) => console.debug(message, ...args),
+            info: (message: string, ...args: unknown[]) => console.info(message, ...args),
+            warn: (message: string, ...args: unknown[]) => console.warn(message, ...args),
+            error: (message: string, ...args: unknown[]) => console.error(message, ...args),
+        }
+        : undefined;
+    const webFileTools = enableWebTools
+        ? createWebFileReturnTools(workspacePath, webToolLogger)
+        : [];
 
     // Combine all tools
-    const allTools = [...memoryTools, execTool, ...cronTools, ...dingtalkFileTools, ...mcpTools];
+    const allTools = [...memoryTools, execTool, ...cronTools, ...dingtalkFileTools, ...webFileTools, ...mcpTools];
 
     // Load initial memory context for system prompt
     const memoryContext = loadMemoryContext(workspacePath);
@@ -458,9 +471,14 @@ export async function createSREAgent(
             '- 需要生成并回传给 DingTalk 的文件，统一写到 workspace/tmp。',
             '- 需要回传附件时，优先调用 dingtalk_write_tmp_file / dingtalk_send_file，不要依赖回复文本标签触发。',
         ]
-        : [
+        : enableWebTools
+            ? [
+                '- 需要生成并回传给 Web UI 的文件，统一写到 workspace/tmp。',
+                '- 需要回传附件时，优先调用 web_write_tmp_file / web_send_file，不要只在正文里写文件路径。',
+            ]
+            : [
             '- 需要生成附件时，统一写到 workspace/tmp；具体回传由接入渠道适配层处理。',
-        ];
+            ];
 
     const systemPrompt = `你是 SREBot，一位可靠的 SRE 协作伙伴。目标是帮助用户高质量完成运维、排障、告警处置与自动化任务。
 

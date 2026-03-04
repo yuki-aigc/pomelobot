@@ -70,11 +70,14 @@ pnpm dingtalk
 # iOS WebSocket 模式
 pnpm ios
 
+# Web UI + WebSocket 模式
+pnpm web
+
 # 统一服务端（多渠道入口，按 config/CHANNELS 启动）
 pnpm run server
 ```
 
-多渠道启动方式（当前已实现 dingtalk + ios）：
+多渠道启动方式（当前已实现 dingtalk + ios + web）：
 
 ```bash
 # 启动 config.json 中所有 enabled 渠道
@@ -83,7 +86,8 @@ pnpm run server
 # 按环境变量显式指定渠道（逗号分隔）
 CHANNELS=dingtalk pnpm run server
 CHANNELS=ios pnpm run server
-CHANNELS=dingtalk,ios pnpm run server
+CHANNELS=web pnpm run server
+CHANNELS=dingtalk,ios,web pnpm run server
 
 # 生产建议：先构建再运行统一入口
 pnpm build
@@ -97,6 +101,7 @@ pnpm start:server
 - 服务端日志：`logs/server-YYYY-MM-DD.log`
 - 钉钉通道日志：`logs/dingtalk-server-YYYY-MM-DD.log`
 - iOS 通道日志：`logs/ios-server-YYYY-MM-DD.log`
+- Web 通道日志：`logs/web-server-YYYY-MM-DD.log`
 
 ## 文档导航
 
@@ -104,6 +109,7 @@ pnpm start:server
 - [Compaction 机制说明](docs/compaction.md)
 - [Memory + Compaction 流程图](docs/architecture-memory-compaction.md)
 - [渠道网关设计](docs/channel-gateway.md)
+- [Web 渠道 API](docs/web-api.md)
 - [容器与部署说明](docs/deployment-container.md)
 
 ## 项目结构
@@ -114,6 +120,7 @@ pomelobot/
 │   ├── index.ts                 # CLI 入口
 │   ├── dingtalk.ts              # DingTalk 入口
 │   ├── ios.ts                   # iOS WebSocket 入口
+│   ├── web.ts                   # Web UI + WebSocket 入口
 │   ├── server.ts                # 多渠道统一服务端入口
 │   ├── agent.ts                 # 主代理创建与工具注册
 │   ├── config.ts                # 配置加载与类型定义
@@ -160,9 +167,13 @@ pomelobot/
 │       │   ├── approvals.ts     # 命令执行审批（文本 / 按钮模式）
 │       │   ├── context.ts       # 会话上下文管理
 │       │   └── types.ts
-│       └── ios/
-│           ├── adapter.ts       # iOS WebSocket ChannelAdapter
-│           └── types.ts         # iOS 消息协议类型
+│       ├── ios/
+│       │   ├── adapter.ts       # iOS WebSocket ChannelAdapter
+│       │   └── types.ts         # iOS 消息协议类型
+│       └── web/
+│           ├── adapter.ts       # Web ChannelAdapter + HTTP/WS server
+│           ├── ui.ts            # 内置 UI 页面
+│           └── types.ts         # Web 消息协议类型
 ├── workspace/
 │   ├── MEMORY.md                # 长期记忆
 │   ├── AGENTS.md                # 项目级执行规范（Prompt Bootstrap）
@@ -472,6 +483,27 @@ MEMORY_PG_PASSWORD="xxx"
 
 > iOS target 约定：`conversation:<id>` / `user:<id>` / `connection:<id>`，无前缀时按 conversationId 解析。
 
+### Web UI + WebSocket
+
+```jsonc
+{
+    "web": {
+        "enabled": false,
+        "host": "0.0.0.0",
+        "port": 18081,
+        "path": "/ws/web",
+        "uiPath": "/web",
+        "title": "Pomelobot Web",
+        "authToken": "",                   // 可选：浏览器 hello 认证
+        "debug": false,
+        "maxPayloadBytes": 1048576,
+        "pingIntervalMs": 30000
+    }
+}
+```
+
+> 启动后直接打开 `http://<host>:<port><uiPath>`。浏览器会走同端口 WebSocket，并接收 `reply_start / reply_delta / reply_final` 流式事件。
+
 ## 斜杠命令
 
 在 CLI 交互模式下，支持以下命令：
@@ -585,6 +617,25 @@ CHANNELS=ios pnpm run server
 - 用户消息使用 `type=message`，最少包含 `text`，其余字段可由服务端自动补全
 - 服务端回复 `type=reply`，主动推送为 `type=proactive`
 - iOS 定时任务推送目标支持：`conversation:<id>` / `user:<id>` / `connection:<id>`
+
+## Web UI 服务
+
+```bash
+pnpm web
+
+# 或统一入口
+CHANNELS=web pnpm run server
+```
+
+### 功能支持
+
+- **内置 UI 页面**：后端同端口直接托管页面，无需额外前端 dev server
+- **流式打印**：浏览器接收 `reply_start / reply_delta / reply_final`
+- **Markdown 渲染**：助手回复支持标题、列表、引用、代码块等基础 Markdown
+- **代码高亮**：对 `ts/js/json/bash/sql/yaml` 等常见代码块做轻量高亮
+- **附件回传**：Agent 可通过 `web_write_tmp_file / web_send_file` 生成并回传 `workspace/tmp` 下文件
+- **会话隔离**：按 `conversationId` 建立独立 thread，支持手动新开会话
+- **工具状态提示**：收到 `tool_start / tool_end` 时页面会显示当前工具状态
 
 ## 容器部署
 

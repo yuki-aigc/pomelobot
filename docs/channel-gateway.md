@@ -47,7 +47,17 @@
   - `sendReply`：优先按连接回包，回退按会话/用户路由
   - `sendProactive`：支持 `conversation:<id>` / `user:<id>` / `connection:<id>`
 
-### 2.5 Cron 渠道隔离（新增）
+### 2.5 Web Adapter（新增）
+
+- 文件：`src/channels/web/adapter.ts`
+- 能力：
+  - 内置 HTTP Server + WS Server，同端口托管 UI 和对话通道
+  - 支持 `hello` / `message` / `ping` 协议
+  - 浏览器流式事件：`reply_start` / `reply_delta` / `reply_final`
+  - UI 侧支持基础 Markdown 渲染、代码块高亮、附件下载
+  - `sendReply` / `sendProactive` 同样支持按连接、会话、用户路由
+
+### 2.6 Cron 渠道隔离（新增）
 
 - 文件：`src/cron/runtime.ts`
 - 能力：
@@ -57,12 +67,12 @@
   - `cron_job_add/update` 新增 `channel` 字段
   - 默认从当前会话推断 `channel + target`
 
-### 2.6 统一服务端注册
+### 2.7 统一服务端注册
 
 - 文件：`src/server.ts`
 - 变化：
-  - `SUPPORTED_CHANNELS = dingtalk + ios`
-  - 可通过 `CHANNELS=dingtalk,ios` 同时启动多渠道
+  - `SUPPORTED_CHANNELS = dingtalk + ios + web`
+  - 可通过 `CHANNELS=dingtalk,ios,web` 同时启动多渠道
   - 按渠道输出独立日志文件
 
 ## 3. 启动模型
@@ -72,6 +82,7 @@
 ```bash
 pnpm dingtalk
 pnpm ios
+pnpm web
 ```
 
 ### 3.2 统一服务端（多渠道入口）
@@ -80,7 +91,8 @@ pnpm ios
 pnpm run server
 CHANNELS=dingtalk pnpm run server
 CHANNELS=ios pnpm run server
-CHANNELS=dingtalk,ios pnpm run server
+CHANNELS=web pnpm run server
+CHANNELS=dingtalk,ios,web pnpm run server
 ```
 
 ## 4. 日志
@@ -90,6 +102,7 @@ CHANNELS=dingtalk,ios pnpm run server
 - `logs/server-YYYY-MM-DD.log`：网关/服务端日志
 - `logs/dingtalk-server-YYYY-MM-DD.log`：DingTalk 通道日志
 - `logs/ios-server-YYYY-MM-DD.log`：iOS 通道日志
+- `logs/web-server-YYYY-MM-DD.log`：Web 通道日志
 
 ## 5. iOS 协议约定
 
@@ -106,7 +119,26 @@ CHANNELS=dingtalk,ios pnpm run server
 - `proactive`
 - `dispatch_ack`
 
-## 6. 新增渠道接入步骤（建议）
+## 6. Web 协议约定
+
+客户端 -> 服务端：
+
+- `hello`：会话初始化，可带 `token`
+- `message`：用户消息，核心字段 `text`
+- `ping`：心跳
+
+服务端 -> 客户端：
+
+- `hello_ack`
+- `reply_start`
+- `reply_delta`
+- `reply_final`
+- `tool_start`
+- `tool_end`
+- `proactive`
+- `dispatch_ack`
+
+## 7. 新增渠道接入步骤（建议）
 
 1. 新建 `src/channels/<channel>/adapter.ts` 并实现 `ChannelAdapter`
 2. 解析渠道原始消息为 `ChannelInboundMessage`
@@ -115,7 +147,7 @@ CHANNELS=dingtalk,ios pnpm run server
 5. 在 `src/cron/runtime.ts` 注册该渠道 cron service
 6. 补充渠道配置项与 README 文档
 
-## 7. 约束与建议
+## 8. 约束与建议
 
 - 幂等键建议优先使用渠道原生 message id，避免重放造成重复执行
 - 非 DingTalk 渠道建议自定义 session scope 前缀，避免记忆串线

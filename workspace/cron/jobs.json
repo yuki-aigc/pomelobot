@@ -7,7 +7,7 @@
       "description": "自动创建，请勿删除。[system:auto-memory-save-4am:v1]",
       "enabled": true,
       "createdAtMs": 1770709421291,
-      "updatedAtMs": 1772503645947,
+      "updatedAtMs": 1772568051970,
       "schedule": {
         "kind": "cron",
         "expr": "0 4 * * *",
@@ -15,7 +15,7 @@
       },
       "payload": {
         "kind": "agentTurn",
-        "message": "请执行每日记忆归档任务。\n要求：\n1. 回顾最近24小时对话中的关键事实、告警分析、定位结论、处置动作、遗留风险与待办。\n2. 调用 memory_save，target 必须是 daily；内容需要结构化且可复盘。\n3. 完成后在回复末尾明确输出: memory_saved。\n注意：若你没有调用 memory_save 就结束任务，视为失败。"
+        "message": "请执行每日记忆归档任务。\n要求：\n1. 回顾最近24小时对话中的关键事实、告警分析、定位结论、处置动作、遗留风险与待办。\n2. 输出内容必须使用以下固定结构；没有信息时写“无”：\n## 当前任务\n- ...\n\n## 最新用户请求\n- ...\n\n## 已完成进展\n- ...\n\n## 进行中工作\n- ...\n\n## 待办与后续承诺\n- ...\n\n## 关键决策与约束\n- ...\n\n## 未解决问题与风险\n- ...\n3. 输出内容必须满足以下要求：\n   1) 使用中文。\n   2) 使用上面的固定结构；没有信息时写“无”。\n   3) 优先保留“进行中工作态”，不要只写静态结论。\n   4) 不要编造未出现的信息，不要把猜测写成事实。\n   5) 保持简洁，适合作为后续对话继续执行任务的工作摘要。\n4. 调用 memory_save，target 必须是 daily；content 直接填写上面的结构化摘要正文，不要包“对话摘要:”前缀。\n5. 完成后在回复末尾明确输出: memory_saved。\n注意：若你没有调用 memory_save 就结束任务，视为失败。"
       },
       "delivery": {
         "channel": "dingtalk",
@@ -24,7 +24,11 @@
         "title": "SREBot 定时任务"
       },
       "state": {
-        "nextRunAtMs": 1772568000000
+        "nextRunAtMs": 1772654400000,
+        "lastRunAtMs": 1772568051970,
+        "lastStatus": "error",
+        "lastError": "Request failed with status code 400",
+        "lastDurationMs": 51962
       }
     }
   ]

@@ -196,6 +196,18 @@ const configSchemaInternal = z.object({
             runLog: z.string().optional(),
         }).optional(),
     }).optional(),
+    web: z.object({
+        enabled: z.boolean(),
+        host: z.string().min(1),
+        port: z.number().int().positive(),
+        path: z.string().min(1),
+        uiPath: z.string().min(1),
+        title: z.string().min(1),
+        authToken: z.string().optional(),
+        debug: z.boolean().optional(),
+        maxPayloadBytes: z.number().int().positive().optional(),
+        pingIntervalMs: z.number().int().nonnegative().optional(),
+    }).optional(),
 });
 
 export const configSchema = configSchemaInternal;

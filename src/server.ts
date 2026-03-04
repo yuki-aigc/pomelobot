@@ -1,6 +1,7 @@
 import { loadConfig } from './config.js';
 import { startDingTalkService } from './dingtalk.js';
 import { startIOSService } from './ios.js';
+import { startWebService } from './web.js';
 import { createRuntimeLogWriter } from './log/runtime.js';
 
 const colors = {
@@ -16,7 +17,7 @@ type RunningChannelService = {
     shutdown: () => Promise<void>;
 };
 
-const SUPPORTED_CHANNELS = new Set(['dingtalk', 'ios']);
+const SUPPORTED_CHANNELS = new Set(['dingtalk', 'ios', 'web']);
 
 function resolveConfiguredChannels(config: ReturnType<typeof loadConfig>): string[] {
     const channels: string[] = [];
@@ -25,6 +26,9 @@ function resolveConfiguredChannels(config: ReturnType<typeof loadConfig>): strin
     }
     if (config.ios?.enabled) {
         channels.push('ios');
+    }
+    if (config.web?.enabled) {
+        channels.push('web');
     }
     return channels;
 }
@@ -57,6 +61,7 @@ export async function startServer(): Promise<void> {
     const serverLogWriter = createRuntimeLogWriter({ prefix: 'server' });
     const dingtalkLogWriter = createRuntimeLogWriter({ prefix: 'dingtalk-server' });
     const iosLogWriter = createRuntimeLogWriter({ prefix: 'ios-server' });
+    const webLogWriter = createRuntimeLogWriter({ prefix: 'web-server' });
 
     const logInfo = (message: string, ...args: unknown[]) => {
         serverLogWriter.write('INFO', message, args);
@@ -79,6 +84,7 @@ export async function startServer(): Promise<void> {
         logInfo(`[Server] logs -> ${serverLogWriter.filePath}`);
         logInfo(`[Server] dingtalk logs -> ${dingtalkLogWriter.filePath}`);
         logInfo(`[Server] ios logs -> ${iosLogWriter.filePath}`);
+        logInfo(`[Server] web logs -> ${webLogWriter.filePath}`);
 
         if (requestedChannels.length === 0) {
             throw new Error('未找到可启动渠道。请检查 config.json 中各渠道 enabled，或设置 CHANNELS 环境变量。');
@@ -124,6 +130,23 @@ export async function startServer(): Promise<void> {
                     shutdown: runtime.shutdown,
                 });
                 logInfo('[Server] channel started: ios');
+                continue;
+            }
+
+            if (channel === 'web') {
+                if (!config.web?.enabled) {
+                    throw new Error('请求启动 web，但 config.web.enabled=false');
+                }
+                const runtime = await startWebService({
+                    registerSignalHandlers: false,
+                    exitOnShutdown: false,
+                    logWriter: webLogWriter,
+                });
+                running.push({
+                    channel: 'web',
+                    shutdown: runtime.shutdown,
+                });
+                logInfo('[Server] channel started: web');
             }
         }
 
@@ -152,6 +175,7 @@ export async function startServer(): Promise<void> {
                 serverLogWriter.close().catch(() => undefined),
                 dingtalkLogWriter.close().catch(() => undefined),
                 iosLogWriter.close().catch(() => undefined),
+                webLogWriter.close().catch(() => undefined),
             ]);
 
             process.exit(hasError ? 1 : 0);
@@ -171,6 +195,7 @@ export async function startServer(): Promise<void> {
             serverLogWriter.close().catch(() => undefined),
             dingtalkLogWriter.close().catch(() => undefined),
             iosLogWriter.close().catch(() => undefined),
+            webLogWriter.close().catch(() => undefined),
         ]);
         throw error;
     }
