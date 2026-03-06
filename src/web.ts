@@ -39,7 +39,7 @@ import {
     sanitizeUserFacingText,
 } from './channels/streaming.js';
 import type { RuntimeLogWriter } from './log/runtime.js';
-import { createSkillDirectoryMonitor, executeSkillSlashCommand } from './skills/index.js';
+import { createSkillDirectoryMonitor, executeSkillSlashCommand, parseSkillSlashCommand } from './skills/index.js';
 
 const conversationQueue = new Map<string, Promise<void>>();
 
@@ -51,7 +51,7 @@ interface WebConversationRuntimeState {
     lastUpdatedAt: number;
 }
 
-type WebSlashCommand =
+export type WebSlashCommand =
     | { type: 'list_models' }
     | { type: 'status' }
     | { type: 'switch_model'; alias: string }
@@ -104,9 +104,12 @@ function createWebThreadId(conversationId: string): string {
     return `web-${conversationId}-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
 }
 
-function parseWebSlashCommand(input: string): WebSlashCommand | null {
+export function parseWebSlashCommand(input: string): WebSlashCommand | null {
     const text = input.trim();
     if (!text.startsWith('/')) {
+        return null;
+    }
+    if (parseSkillSlashCommand(text)) {
         return null;
     }
     if (text === '/models') {
