@@ -110,6 +110,7 @@ pnpm start:server
 - [Memory 机制说明](docs/memory.md)
 - [Compaction 机制说明](docs/compaction.md)
 - [Memory + Compaction 流程图](docs/architecture-memory-compaction.md)
+- [多 Agent / 多 Session 设计](docs/multi-agent-architecture.md)
 - [渠道网关设计](docs/channel-gateway.md)
 - [Web 渠道 API](docs/web-api.md)
 - [容器与部署说明](docs/deployment-container.md)
