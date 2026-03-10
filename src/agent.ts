@@ -4,6 +4,8 @@ import {
 } from 'deepagents';
 import { MemorySaver } from '@langchain/langgraph';
 import { tool } from '@langchain/core/tools';
+import { AIMessage, AIMessageChunk, ChatMessageChunk } from '@langchain/core/messages';
+import { createMiddleware } from 'langchain';
 import { z } from 'zod';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -206,6 +208,145 @@ function wrapAgentWithCredentialEnv(agent: RuntimeAgent): RuntimeAgent {
                 }
             })(),
     };
+}
+
+type NormalizedToolCall = {
+    id?: string;
+    name: string;
+    args: Record<string, unknown>;
+    type: 'tool_call';
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseToolCallsFromAdditionalKwargs(additionalKwargs: unknown): NormalizedToolCall[] {
+    if (!isRecord(additionalKwargs)) {
+        return [];
+    }
+
+    const rawToolCalls = additionalKwargs.tool_calls;
+    if (!Array.isArray(rawToolCalls) || rawToolCalls.length === 0) {
+        return [];
+    }
+
+    const normalized: NormalizedToolCall[] = [];
+    const chunkGroups = new Map<string, { id?: string; name?: string; argsText: string; order: number }>();
+
+    for (const item of rawToolCalls) {
+        if (!isRecord(item)) {
+            continue;
+        }
+
+        const directName = typeof item.name === 'string' ? item.name : null;
+        const directArgs = isRecord(item.args) ? item.args : null;
+        if (directName && directArgs) {
+            normalized.push({
+                id: typeof item.id === 'string' ? item.id : undefined,
+                name: directName,
+                args: directArgs,
+                type: 'tool_call',
+            });
+            continue;
+        }
+
+        const fn = isRecord(item.function) ? item.function : null;
+        const rawId = typeof item.id === 'string' ? item.id : undefined;
+        const rawIndex = typeof item.index === 'number' ? item.index : null;
+        const key = rawIndex !== null
+            ? `index:${rawIndex}`
+            : rawId
+                ? `id:${rawId}`
+                : `pos:${chunkGroups.size}`;
+        const group = chunkGroups.get(key) || { argsText: '', order: chunkGroups.size };
+
+        if (rawId) {
+            group.id = rawId;
+        }
+        if (fn && typeof fn.name === 'string' && fn.name.trim()) {
+            group.name = fn.name.trim();
+        }
+        const fnArgs = fn?.arguments;
+        if (typeof fnArgs === 'string' && fnArgs) {
+            group.argsText += fnArgs;
+        } else if (isRecord(fnArgs)) {
+            group.argsText += JSON.stringify(fnArgs);
+        }
+
+        chunkGroups.set(key, group);
+    }
+
+    const groupedChunks = Array.from(chunkGroups.values()).sort((a, b) => a.order - b.order);
+    for (const group of groupedChunks) {
+        if (!group.name) {
+            continue;
+        }
+
+        let args: Record<string, unknown> = {};
+        const rawArgs = group.argsText.trim();
+        if (rawArgs) {
+            try {
+                const parsed = JSON.parse(rawArgs);
+                if (isRecord(parsed)) {
+                    args = parsed;
+                }
+            } catch {
+                // Ignore malformed chunked tool args and keep empty args.
+            }
+        }
+
+        normalized.push({
+            id: group.id,
+            name: group.name,
+            args,
+            type: 'tool_call',
+        });
+    }
+
+    return normalized;
+}
+
+function stripRawToolCalls(additionalKwargs: unknown): Record<string, unknown> {
+    if (!isRecord(additionalKwargs)) {
+        return {};
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(additionalKwargs, 'tool_calls')) {
+        return additionalKwargs;
+    }
+
+    const cloned = { ...additionalKwargs };
+    delete cloned.tool_calls;
+    return cloned;
+}
+
+function createModelResponseCompatibilityMiddleware() {
+    return createMiddleware({
+        name: 'ModelResponseCompatibilityMiddleware',
+        wrapModelCall: async (request, handler) => {
+            const response = await handler(request);
+
+            // Some OpenAI-compatible providers can return *MessageChunk types in streamEvents mode.
+            // LangChain middleware pipeline expects AIMessage here, so normalize chunk responses.
+            if (AIMessageChunk.isInstance(response) || ChatMessageChunk.isInstance(response)) {
+                const toolCalls = Array.isArray((response as { tool_calls?: unknown[] }).tool_calls)
+                    ? (response as { tool_calls: NormalizedToolCall[] }).tool_calls
+                    : parseToolCallsFromAdditionalKwargs((response as { additional_kwargs?: unknown }).additional_kwargs);
+
+                return new AIMessage({
+                    content: response.content,
+                    additional_kwargs: stripRawToolCalls(response.additional_kwargs),
+                    response_metadata: response.response_metadata,
+                    id: response.id,
+                    name: response.name,
+                    tool_calls: toolCalls,
+                });
+            }
+
+            return response;
+        },
+    });
 }
 
 /**
@@ -413,6 +554,7 @@ export async function createSREAgent(
     const enableWebTools = runtimeChannel === 'web';
     const workspacePath = resolve(process.cwd(), cfg.agent.workspace);
     const skillsPath = resolve(process.cwd(), cfg.agent.skills_dir);
+    const modelResponseCompatibilityMiddleware = createModelResponseCompatibilityMiddleware();
 
     // Create OpenAI model
     const model = await createChatModel(cfg, { temperature: 0 });
@@ -569,6 +711,7 @@ ${mcpServersHint}`;
             subagents,
             backend: () => new FilesystemBackend({ rootDir: workspacePath }),
             skills: [skillsPath],
+            middleware: [modelResponseCompatibilityMiddleware as unknown as never],
             checkpointer,
         }));
         agent = wrapAgentWithCredentialEnv(createdAgent as unknown as RuntimeAgent);
