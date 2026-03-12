@@ -131,32 +131,32 @@ test('skill file rejects unsafe relative path', async () => {
     }
 });
 
-test('memory markdown read/write supports default MEMORY.md and daily memory path', async () => {
+test('memory markdown read/write supports scoped MEMORY.md and scoped daily path', async () => {
     const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'pomelobot-web-memory-store-'));
 
     try {
         const first = await readMemoryMarkdownFile({ workspaceRoot });
         assert.equal(first.exists, false);
-        assert.equal(first.relativePath, 'MEMORY.md');
+        assert.equal(first.relativePath, 'memory/scopes/main/MEMORY.md');
 
         const writeDefault = await writeMemoryMarkdownFile({
             workspaceRoot,
             content: '# MEMORY\n\nabc',
         });
         assert.equal(writeDefault.exists, true);
-        assert.equal(writeDefault.relativePath, 'MEMORY.md');
+        assert.equal(writeDefault.relativePath, 'memory/scopes/main/MEMORY.md');
 
         const writeDaily = await writeMemoryMarkdownFile({
             workspaceRoot,
-            relativePath: 'memory/2026-03-11.md',
+            relativePath: 'memory/scopes/main/2026-03-11.md',
             content: '# Daily\n\nnote',
         });
         assert.equal(writeDaily.exists, true);
-        assert.equal(writeDaily.relativePath, 'memory/2026-03-11.md');
+        assert.equal(writeDaily.relativePath, 'memory/scopes/main/2026-03-11.md');
 
         const readDaily = await readMemoryMarkdownFile({
             workspaceRoot,
-            relativePath: 'memory/2026-03-11.md',
+            relativePath: 'memory/scopes/main/2026-03-11.md',
         });
         assert.equal(readDaily.exists, true);
         assert.equal(readDaily.content, '# Daily\n\nnote');

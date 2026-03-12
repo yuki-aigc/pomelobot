@@ -5,9 +5,9 @@ import { isPathInsideDir } from './file-utils.js';
 
 const SKILL_MARKDOWN_FILE = 'SKILL.md';
 const DEFAULT_SKILL_REL_PATH = SKILL_MARKDOWN_FILE;
-const DEFAULT_MEMORY_REL_PATH = 'MEMORY.md';
+const DEFAULT_MEMORY_REL_PATH = 'memory/scopes/main/MEMORY.md';
 const SKILL_DIR_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const MEMORY_REL_PATH_RE = /^(MEMORY\.md|memory(?:\/[A-Za-z0-9._-]+)+\.md)$/u;
+const MEMORY_REL_PATH_RE = /^memory\/scopes\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.md$/u;
 const MAX_SKILL_TEXT_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_SKILL_TREE_ENTRIES = 3000;
 
@@ -91,7 +91,7 @@ function normalizeMemoryRelPath(rawPath?: string): string {
     const candidate = rawPath?.trim() || DEFAULT_MEMORY_REL_PATH;
     const normalized = normalizeSafeRelativePath(candidate);
     if (!MEMORY_REL_PATH_RE.test(normalized)) {
-        throw new Error('memory 路径非法：仅允许 MEMORY.md 或 memory/**/*.md');
+        throw new Error('memory 路径非法：仅允许 memory/scopes/**/*.md');
     }
     return normalized;
 }

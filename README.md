@@ -22,11 +22,11 @@
 | 能力 | 说明 |
 |------|------|
 | 🧠 **记忆系统** | PGSQL 增量索引（可回退文件模式），支持 FTS / Vector / Hybrid 检索与会话隔离 |
-| 🧩 **冷启动记忆** | DingTalk 会话首轮可注入“今天/昨天”Markdown 摘要（有注入限额，避免 token 膨胀） |
+| 🧩 **冷启动记忆** | DingTalk / Web 会话首轮可注入“今天/昨天”Markdown 摘要（有注入限额，避免 token 膨胀） |
 | ⚡ **会话向量召回** | `session_events` 向量异步回填 + PG 内 ANN 检索，失败自动回退 FTS / temporal |
 | ♻️ **会话TTL治理** | `session_events` 支持按 TTL 自动清理，控制历史体量与检索成本 |
 | 🧹 **上下文压缩** | 自动 / 手动压缩对话历史，实时展示 Token 使用情况 |
-| 🧭 **Prompt Bootstrap** | 支持 OpenClaw 风格 `AGENTS/TOOLS/SOUL/HEARTBEAT` 多文件注入，含规则优先级与 scope 覆盖 |
+| 🧭 **Prompt Bootstrap** | 支持 OpenClaw 风格 `AGENTS/TOOLS/SOUL/HEARTBEAT/MEMORY` 多文件注入，含规则优先级与 scope 覆盖 |
 | 🛠️ **技能系统** | 以 `SKILL.md` 定义技能，支持热重载、本地/远程安装，并通过子代理协作 |
 | 🔌 **MCP 集成** | 通过 `@langchain/mcp-adapters` 挂载 MCP 工具（stdio / http / sse） |
 | 🤖 **多模型支持** | OpenAI / Anthropic（多模型配置池，运行时 `/model` 热切换） |
@@ -360,7 +360,7 @@ MEMORY_PG_PASSWORD="xxx"
 - `workspace/SOUL.md`：角色与风格定义
 - `workspace/HEARTBEAT.md`：纠错与复盘经验
 - scope 级覆盖：`workspace/memory/scopes/<scope>/{TOOLS.md,SOUL.md,HEARTBEAT.md}`（存在时优先）
-- `workspace/MEMORY.md` 不属于 Prompt Bootstrap；它是长期记忆文件，使用方式见 [Memory 机制说明](docs/memory.md)
+- `MEMORY.md` 会在首轮 Prompt Bootstrap 中按 scope 注入：优先 `workspace/memory/scopes/<scope>/MEMORY.md`（`main` 保留 root `MEMORY.md` 的兼容回退）
 
 系统会在每个 `thread_id` 的首轮调用时注入引导文件；同一线程不会重复注入，修改文件后需进入新的 `thread_id` 才会重新生效。冲突处理优先级如下：
 

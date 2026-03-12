@@ -63,9 +63,14 @@ import {
 import { HumanMessage as LCHumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { withDingTalkConversationContext, consumeQueuedDingTalkReplyFiles } from './context.js';
-import { resolveMemoryScope, type MemoryScope } from '../../middleware/memory-scope.js';
+import { resolveMemoryScope, withForcedMemoryScope, type MemoryScope } from '../../middleware/memory-scope.js';
 import { DingTalkSessionStore, createSessionThreadId } from './session-store.js';
 import { buildPromptBootstrapMessage } from '../../prompt/bootstrap.js';
+import {
+    buildSessionStartupMemoryInjection,
+    buildUserMessagesWithMemoryPolicy,
+    hasMemoryRecallIntent,
+} from '../../prompt/memory-policy.js';
 import { executeSkillSlashCommand } from '../../skills/index.js';
 import { executeCronSlashCommand } from '../../cron/slash.js';
 
@@ -91,10 +96,6 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_VIDEO_FRAMES = 3;
 const MAX_REPLY_FILES = 3;
 const MAX_REPLY_FILE_BYTES = 10 * 1024 * 1024;
-const STARTUP_MEMORY_MAX_FILES = 2;
-const STARTUP_MEMORY_MAX_LINES_PER_FILE = 80;
-const STARTUP_MEMORY_MAX_FILE_CHARS = 1200;
-const STARTUP_MEMORY_MAX_TOTAL_CHARS = 2400;
 const commandAvailabilityCache = new Map<string, boolean>();
 const execFileAsync = promisify(execFileCallback);
 const DINGTALK_FILE_TAG_PATTERN = /<dingtalk-file\s+path=(?:"([^"]+)"|'([^']+)')\s*\/?>/gi;
@@ -484,145 +485,18 @@ function extractTextFromModelContent(content: unknown): string {
     return chunks.join('\n').trim();
 }
 
-function hasMemoryRecallIntent(text: string): boolean {
-    return /(你还记得|还记得吗|之前|上次|昨天|昨日|前天|刚才|刚刚|问过|聊过|历史|回顾|回溯|做过什么|提过什么)/u.test(text);
-}
-
-function formatLocalDateWithOffset(baseDate: Date, offsetDays: number): string {
-    const date = new Date(baseDate.getTime() + (offsetDays * 24 * 60 * 60 * 1000));
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-}
-
-function resolveScopedDailyMemoryPath(workspacePath: string, scopeKey: string, dateKey: string): string {
-    if (scopeKey === 'main') {
-        return path.join(workspacePath, 'memory', `${dateKey}.md`);
+function inferScopeFromSessionKey(sessionKey: string, groupScopePrefix: string): MemoryScope {
+    const normalized = sessionKey.trim();
+    if (!normalized || normalized === 'main') {
+        return { key: 'main', kind: 'main' };
     }
-    return path.join(workspacePath, 'memory', 'scopes', scopeKey, `${dateKey}.md`);
-}
-
-function compactStartupMemoryText(content: string): string {
-    const lines = content
-        .split('\n')
-        .map((line) => line.trimEnd())
-        .filter((line) => line.trim().length > 0);
-    const tail = lines.slice(-STARTUP_MEMORY_MAX_LINES_PER_FILE);
-    const merged = tail.join('\n').trim();
-    if (merged.length <= STARTUP_MEMORY_MAX_FILE_CHARS) {
-        return merged;
+    if (normalized.startsWith('direct_')) {
+        return { key: normalized, kind: 'direct' };
     }
-    return `${merged.slice(0, Math.max(0, STARTUP_MEMORY_MAX_FILE_CHARS - 1))}…`;
-}
-
-function trimInjectionByTotalChars(blocks: string[], maxChars: number): string[] {
-    if (maxChars <= 0) {
-        return [];
+    if (normalized.startsWith(groupScopePrefix)) {
+        return { key: normalized, kind: 'group' };
     }
-    const output: string[] = [];
-    let used = 0;
-    for (const block of blocks) {
-        if (!block) {
-            continue;
-        }
-        const remaining = maxChars - used;
-        if (remaining <= 0) {
-            break;
-        }
-        if (block.length <= remaining) {
-            output.push(block);
-            used += block.length;
-            continue;
-        }
-        if (remaining >= 20) {
-            output.push(`${block.slice(0, Math.max(0, remaining - 1))}…`);
-            used = maxChars;
-        }
-        break;
-    }
-    return output;
-}
-
-async function buildSessionStartupMemoryInjection(params: {
-    workspacePath: string;
-    scopeKey: string;
-    now?: Date;
-}): Promise<string | null> {
-    const now = params.now ?? new Date();
-    const dateKeys = [
-        formatLocalDateWithOffset(now, 0),
-        formatLocalDateWithOffset(now, -1),
-    ];
-    const snippets: string[] = [];
-
-    for (const dateKey of dateKeys.slice(0, STARTUP_MEMORY_MAX_FILES)) {
-        const absPath = resolveScopedDailyMemoryPath(params.workspacePath, params.scopeKey, dateKey);
-        let raw = '';
-        try {
-            raw = await fsPromises.readFile(absPath, 'utf-8');
-        } catch {
-            continue;
-        }
-        const compact = compactStartupMemoryText(raw);
-        if (!compact || compact.length < 20) {
-            continue;
-        }
-        const relPath = path.relative(params.workspacePath, absPath).replace(/\\/g, '/');
-        snippets.push(`### ${dateKey} (${relPath})\n${compact}`);
-    }
-
-    if (snippets.length === 0) {
-        return null;
-    }
-
-    const header = [
-        '【会话启动记忆注入（今昨摘要）】',
-        '以下内容来自 Markdown 记忆文件（非向量库），仅作首轮上下文补充。',
-        '若用户追问历史细节，仍应调用 memory_search / memory_get 取证。',
-        '',
-    ].join('\n');
-    const bodyBlocks = trimInjectionByTotalChars(snippets, Math.max(0, STARTUP_MEMORY_MAX_TOTAL_CHARS - header.length));
-    if (bodyBlocks.length === 0) {
-        return null;
-    }
-    return `${header}${bodyBlocks.join('\n\n')}`;
-}
-
-function buildMemorySearchEnforcedPrompt(userText: string): string {
-    return [
-        '【记忆检索强制规则】',
-        '当前问题属于历史回溯类问题。',
-        '你必须先调用 memory_search 检索，再基于检索结果回答。',
-        '若需要精确引用，再调用 memory_get 读取命中片段。',
-        '如果检索不到，请明确说明“已检索但未找到足够信息”，禁止直接凭空回答。',
-        '',
-        `用户原问题：${userText}`,
-    ].join('\n');
-}
-
-function buildDingTalkAgentMessagesWithPolicy(
-    userText: string,
-    options?: { enforceMemorySearch?: boolean; startupMemoryInjection?: string | null },
-): Array<{ role: 'user'; content: string }> {
-    const messages: Array<{ role: 'user'; content: string }> = [];
-    if (options?.startupMemoryInjection) {
-        messages.push({
-            role: 'user',
-            content: [
-                '【会话启动上下文】',
-                options.startupMemoryInjection,
-                '',
-                '以上是会话启动补充信息，请结合当前问题作答。',
-            ].join('\n'),
-        });
-    }
-    if (options?.enforceMemorySearch) {
-        messages.push({ role: 'user', content: buildMemorySearchEnforcedPrompt(userText) });
-        return messages;
-    }
-    messages.push({ role: 'user', content: userText });
-    return messages;
+    return { key: normalized, kind: 'group' };
 }
 
 function normalizeHistoryContent(content: unknown): string {
@@ -697,7 +571,7 @@ function buildAgentInvocationMessages(
     if (hydratedThreadIds.has(session.threadId)) {
         return normalizeInvocationMessages([
             ...bootstrapMessages,
-            ...buildDingTalkAgentMessagesWithPolicy(userText, options),
+            ...buildUserMessagesWithMemoryPolicy(userText, options),
         ]);
     }
 
@@ -708,14 +582,14 @@ function buildAgentInvocationMessages(
     if (history.length === 0) {
         return normalizeInvocationMessages([
             ...bootstrapMessages,
-            ...buildDingTalkAgentMessagesWithPolicy(userText, options),
+            ...buildUserMessagesWithMemoryPolicy(userText, options),
         ]);
     }
 
     return normalizeInvocationMessages([
         ...bootstrapMessages,
         ...history,
-        ...buildDingTalkAgentMessagesWithPolicy(userText, options),
+        ...buildUserMessagesWithMemoryPolicy(userText, options),
     ]);
 }
 
@@ -2825,8 +2699,15 @@ export async function flushSessionsOnShutdown(params: {
                     session.totalTokens,
                     config.agent.compaction,
                 );
+                const forcedScope = inferScopeFromSessionKey(
+                    sessionKey,
+                    config.agent.memory.session_isolation.group_scope_prefix,
+                );
                 const nextState = await withTimeout(
-                    executeMemoryFlush(agent, session, flushState, config.agent.compaction, log),
+                    withForcedMemoryScope(
+                        forcedScope,
+                        () => executeMemoryFlush(agent, session, flushState, config.agent.compaction, log),
+                    ),
                     flushTimeoutMs,
                     `memory flush timeout after ${flushTimeoutMs}ms`
                 );

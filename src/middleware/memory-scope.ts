@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AgentMemorySessionIsolationConfig } from '../config.js';
 import { getChannelConversationContext } from '../channels/context.js';
 
@@ -6,6 +7,15 @@ export type MemoryScopeKind = 'main' | 'direct' | 'group';
 export interface MemoryScope {
     key: string;
     kind: MemoryScopeKind;
+}
+
+const forcedMemoryScopeStorage = new AsyncLocalStorage<MemoryScope | null>();
+
+export function withForcedMemoryScope<T>(
+    scope: MemoryScope,
+    fn: () => Promise<T>,
+): Promise<T> {
+    return forcedMemoryScopeStorage.run(scope, fn);
 }
 
 function sanitizeScopePart(value: string): string {
@@ -40,6 +50,11 @@ function resolveDirectScopeMode(config: AgentMemorySessionIsolationConfig, chann
 }
 
 export function resolveMemoryScope(config: AgentMemorySessionIsolationConfig): MemoryScope {
+    const forcedScope = forcedMemoryScopeStorage.getStore();
+    if (forcedScope) {
+        return forcedScope;
+    }
+
     const context = getChannelConversationContext();
     if (!context || !config.enabled) {
         return { key: 'main', kind: 'main' };

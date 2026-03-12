@@ -40,21 +40,11 @@ export class MemoryStoreLayer {
 
     resolveScopePaths(scope: MemoryScope): MemoryStorePaths {
         const { workspacePath } = this.deps;
-        if (scope.key === 'main') {
-            const scopeRoot = join(workspacePath, 'memory', 'scopes', 'main');
-            return {
-                scopeRoot,
-                dailyDir: join(workspacePath, 'memory'),
-                longTermPath: join(workspacePath, 'MEMORY.md'),
-                heartbeatPath: join(scopeRoot, 'HEARTBEAT.md'),
-            };
-        }
-
         const scopeRoot = join(workspacePath, 'memory', 'scopes', scope.key);
         return {
             scopeRoot,
             dailyDir: scopeRoot,
-            longTermPath: join(scopeRoot, 'LONG_TERM.md'),
+            longTermPath: join(scopeRoot, 'MEMORY.md'),
             heartbeatPath: join(scopeRoot, 'HEARTBEAT.md'),
         };
     }

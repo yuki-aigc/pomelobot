@@ -345,9 +345,10 @@ function buildMemoryFileHeader(target: 'daily' | 'long-term', scope: MemoryScope
 }
 
 function resolveTeamTargetPath(workspacePath: string, target: 'daily' | 'long-term', date: Date): string {
+    const mainScopeDir = join(workspacePath, 'memory', 'scopes', 'main');
     return target === 'daily'
-        ? join(workspacePath, 'memory', `${formatLocalDate(date)}.md`)
-        : join(workspacePath, 'MEMORY.md');
+        ? join(mainScopeDir, `${formatLocalDate(date)}.md`)
+        : join(mainScopeDir, 'MEMORY.md');
 }
 
 async function upsertTeamMemoryEntry(params: {
@@ -525,7 +526,7 @@ export function createMemoryTools(workspacePath: string, config: Config) {
         },
         {
             name: 'memory_get',
-            description: '按 path 精读记忆片段（建议先 memory_search）。支持 MEMORY.md / HEARTBEAT.md / memory/**/*.md / session_events 路径，可选 from/lines。',
+            description: '按 path 精读记忆片段（建议先 memory_search）。支持 memory/scopes/**/*.md 与 session_events 路径，可选 from/lines。',
             schema: z.object({
                 path: z.string().describe('要读取的记忆路径，建议直接使用 memory_search 返回的 path'),
                 from: z.number().int().min(1).optional().describe('起始行号（从 1 开始），默认 1'),

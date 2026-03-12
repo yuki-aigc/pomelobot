@@ -7,7 +7,7 @@
       "description": "自动创建，请勿删除。[system:auto-memory-save-4am:v1]",
       "enabled": true,
       "createdAtMs": 1770709421291,
-      "updatedAtMs": 1773196495403,
+      "updatedAtMs": 1773259229776,
       "schedule": {
         "kind": "cron",
         "expr": "0 4 * * *",
@@ -24,10 +24,10 @@
         "title": "SREBot 定时任务"
       },
       "state": {
-        "nextRunAtMs": 1773259200000,
-        "lastRunAtMs": 1773116078568,
+        "nextRunAtMs": 1773345600000,
+        "lastRunAtMs": 1773259229776,
         "lastStatus": "ok",
-        "lastDurationMs": 32535
+        "lastDurationMs": 29754
       }
     },
     {
@@ -36,7 +36,7 @@
       "description": "每天早上 8 点自动查询 OpenClaw 项目相关新闻和动态",
       "enabled": true,
       "createdAtMs": 1773114296260,
-      "updatedAtMs": 1773116029212,
+      "updatedAtMs": 1773273614747,
       "schedule": {
         "kind": "cron",
         "expr": "0 8 * * *",
@@ -50,10 +50,10 @@
         "target": "cidiEyrF5XkYWeE9XY4IyDrMg=="
       },
       "state": {
-        "nextRunAtMs": 1773273600000,
-        "lastRunAtMs": 1773116029212,
+        "nextRunAtMs": 1773360000000,
+        "lastRunAtMs": 1773273614747,
         "lastStatus": "ok",
-        "lastDurationMs": 21646
+        "lastDurationMs": 14724
       }
     }
   ]

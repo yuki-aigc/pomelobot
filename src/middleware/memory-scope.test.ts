@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { withChannelConversationContext } from '../channels/context.js';
 import { DEFAULT_CONFIG } from '../config/defaults.js';
-import { resolveMemoryScope } from './memory-scope.js';
+import { resolveMemoryScope, withForcedMemoryScope } from './memory-scope.js';
 
 test('web direct conversations default to shared main scope', async () => {
     const scope = await withChannelConversationContext(
@@ -36,4 +36,27 @@ test('non-web direct conversations still respect direct scope isolation', async 
 
     assert.equal(scope.key, 'direct_user-a');
     assert.equal(scope.kind, 'direct');
+});
+
+test('forced memory scope override has highest priority', async () => {
+    const scope = await withChannelConversationContext(
+        {
+            channel: 'dingtalk',
+            conversationId: 'cid-team-room',
+            isDirect: true,
+            senderId: 'user-a',
+            senderName: 'User A',
+            pendingReplyFiles: [],
+        },
+        async () => withForcedMemoryScope(
+            {
+                key: 'group_forced_scope',
+                kind: 'group',
+            },
+            async () => resolveMemoryScope(DEFAULT_CONFIG.agent.memory.session_isolation),
+        ),
+    );
+
+    assert.equal(scope.key, 'group_forced_scope');
+    assert.equal(scope.kind, 'group');
 });

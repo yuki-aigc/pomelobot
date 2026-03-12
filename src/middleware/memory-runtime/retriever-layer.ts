@@ -85,13 +85,13 @@ function normalizeRankScore(value: number): number {
 
 function isSharedMainMemoryPath(path: string): boolean {
     const normalized = path.replace(/\\/g, '/');
-    if (normalized === 'MEMORY.md' || normalized === 'HEARTBEAT.md') {
+    if (normalized === 'memory/scopes/main/MEMORY.md') {
         return true;
     }
-    if (/^memory\/[^/]+\.md$/u.test(normalized)) {
+    if (normalized === 'memory/scopes/main/HEARTBEAT.md') {
         return true;
     }
-    return normalized === 'memory/scopes/main/HEARTBEAT.md';
+    return /^memory\/scopes\/main\/\d{4}-\d{2}-\d{2}\.md$/u.test(normalized);
 }
 
 export class MemoryRetrieverLayer {

@@ -10,11 +10,11 @@
 | `TOOLS.md` | 工具选择与调用约定 | `workspace/TOOLS.md` | 是 |
 | `SOUL.md` | 身份、语气、风格偏好 | `workspace/SOUL.md` | 是 |
 | `HEARTBEAT.md` | 纠错复盘、行为修正经验 | `workspace/HEARTBEAT.md` | 是 |
-| `MEMORY.md` | 长期记忆与事实背景 | `workspace/MEMORY.md` | 主文件否；隔离 scope 使用独立长期记忆文件 |
+| `MEMORY.md` | 长期记忆与事实背景 | `workspace/memory/scopes/<scope>/MEMORY.md` | 是 |
 
 补充说明：
 - `AGENTS.md` 缺失时，会回退尝试 `workspace/AGENT.md`。
-- `MEMORY.md` 不属于 Prompt Bootstrap 文件集合，它和前四者的用途不同。
+- `MEMORY.md` 会参与 Prompt Bootstrap 首轮注入（按 scope 读取）。
 
 ## 2. 每个文件应该写什么
 
@@ -67,8 +67,8 @@
 
 补充：
 - 如果当前会话里沉淀出应跨群聊/私聊共享的团队知识，应使用 `memory_save_team` 晋升到团队记忆。
-- `memory_save_team(target=long-term)` 会写入全局 `workspace/MEMORY.md`。
-- `memory_save_team(target=daily)` 会写入全局 `workspace/memory/YYYY-MM-DD.md`。
+- `memory_save_team(target=long-term)` 会写入 `workspace/memory/scopes/main/MEMORY.md`。
+- `memory_save_team(target=daily)` 会写入 `workspace/memory/scopes/main/YYYY-MM-DD.md`。
 - `memory_save_team` 建议保存为结构化条目，而不是自由文本，便于长期检索与人工维护。
 - `memory_save_team` 默认按标题做去重/合并，避免 `MEMORY.md` 中出现大量重复团队经验条目。
 
@@ -81,6 +81,7 @@
 - `TOOLS.md`
 - `SOUL.md`
 - `HEARTBEAT.md`
+- `MEMORY.md`
 
 加载特点：
 - 在同一个 `thread_id` 的首轮调用时注入。
@@ -88,19 +89,14 @@
 - 仅 Agent 重建不会让已注入过的旧线程自动重新读取这些文件。
 - 如果你修改了这些文件并希望立即生效，需要让后续请求进入新的 `thread_id`。
 
-### 3.2 `MEMORY.md`
-
-`MEMORY.md` 不走 Prompt Bootstrap 这条链路。
+### 3.2 首轮注入与按需检索
 
 当前实现里：
-- System Prompt 中只注入“如何正确使用记忆工具”的规则提示，不会把 `MEMORY.md` 全量塞进上下文。
-- 需要回溯历史事实时，应优先使用 `memory_search`，必要时再用 `memory_get` 精读。
-- `memory_get` 支持直接读取 `MEMORY.md`、`memory/**/*.md`、`HEARTBEAT.md` 与 `session_events/...` 路径。
-- 当 `shared_main_scope_reads=true` 时，隔离 scope 在检索时还会额外读取 `main` 的团队记忆。
-
-这意味着：
-- `MEMORY.md` 是事实来源。
-- `AGENTS.md`、`TOOLS.md`、`SOUL.md`、`HEARTBEAT.md` 是行为约束或风格约束。
+- Prompt Bootstrap 首轮会注入 `MEMORY.md`（按 scope 读取，`main` 保留旧根目录回退兼容）。
+- DingTalk / Web 在会话首轮还会注入 scope 下“今天 + 昨天”的 daily 摘要（`memory/scopes/<scope>/YYYY-MM-DD.md`）。
+- 需要回溯历史事实时，仍应优先使用 `memory_search`，必要时再用 `memory_get` 精读。
+- `memory_get` 支持读取 `memory/scopes/**/*.md` 与 `session_events/...` 路径。
+- 当 `shared_main_scope_reads=true` 时，隔离 scope 在检索时会额外读取 `main` 的团队记忆文件。
 
 ## 4. Scope 覆盖规则
 
@@ -123,22 +119,16 @@ workspace/memory/scopes/<scope>/HEARTBEAT.md
 1. 如果存在 scope 文件，优先读取 scope 文件。
 2. 否则回退到 `workspace/` 根目录下的全局文件。
 
-### 4.2 不支持覆盖的文件
+### 4.2 特例与团队路径
 
 - `AGENTS.md` 只读取全局文件，不支持 scope 版本。
-- `MEMORY.md` 主文件也是全局根文件；隔离 scope 的长期记忆会写到独立文件，而不是 `workspace/memory/scopes/<scope>/MEMORY.md`。
-
-当前隔离 scope 的长期记忆文件通常位于：
-
-```text
-workspace/memory/scopes/<scope>/LONG_TERM.md
-```
+- `MEMORY.md` 支持 scope 级隔离，路径统一为 `workspace/memory/scopes/<scope>/MEMORY.md`。
 
 团队共享记忆的显式晋升路径为：
 
 ```text
-memory_save_team(target="long-term") -> workspace/MEMORY.md
-memory_save_team(target="daily") -> workspace/memory/YYYY-MM-DD.md
+memory_save_team(target="long-term") -> workspace/memory/scopes/main/MEMORY.md
+memory_save_team(target="daily") -> workspace/memory/scopes/main/YYYY-MM-DD.md
 ```
 
 ## 5. 优先级
@@ -192,18 +182,21 @@ workspace/
 ├── TOOLS.md
 ├── SOUL.md
 ├── HEARTBEAT.md
-├── MEMORY.md
 └── memory/
     └── scopes/
+        ├── main/
+        │   ├── MEMORY.md
+        │   └── 2026-03-12.md
         └── group_ops/
             ├── TOOLS.md
             ├── SOUL.md
             ├── HEARTBEAT.md
-            └── LONG_TERM.md
+            ├── MEMORY.md
+            └── 2026-03-12.md
 ```
 
 在这个例子里：
 - 所有会话都读全局 `AGENTS.md`。
 - `group_ops` scope 会优先使用自己的 `TOOLS.md`、`SOUL.md`、`HEARTBEAT.md`。
-- `group_ops` 的长期记忆读写落在 `LONG_TERM.md`，不会覆盖全局 `MEMORY.md`。
-- 如果 `group_ops` 中某条经验需要晋升为团队共享知识，应调用 `memory_save_team` 写回全局 `MEMORY.md` 或全局 daily。
+- `group_ops` 的长期记忆读写落在 `memory/scopes/group_ops/MEMORY.md`，不会覆盖 `main` scope。
+- 如果 `group_ops` 中某条经验需要晋升为团队共享知识，应调用 `memory_save_team` 写回 `memory/scopes/main/MEMORY.md` 或 `memory/scopes/main/YYYY-MM-DD.md`。

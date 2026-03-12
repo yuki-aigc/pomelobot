@@ -218,6 +218,10 @@ Web 渠道当前默认会做三层持久化：
 - 每条 `user/assistant` 消息尽量写入 PG `session_events`
 - 当单会话 token 接近阈值时，后台触发 memory flush，把“进行中工作态摘要”写入 `daily` 记忆，并轮换 agent thread
 
+同时，Web 侧和 DingTalk 侧已对齐两项记忆策略：
+- 会话首轮会注入 scope 下“今天 + 昨天”的 daily 摘要（`memory/scopes/<scope>/YYYY-MM-DD.md`）
+- 命中回溯意图（如“之前/上次/昨天/聊过/记得吗”）时，会先注入 `memory_search` 强约束提示，再回答
+
 这意味着：
 
 - 原始会话可通过 transcript / `session_events` 回溯

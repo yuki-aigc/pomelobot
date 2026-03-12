@@ -18,14 +18,15 @@ async function createTestRuntime(sharedMainScopeReads: boolean): Promise<{
     config.agent.memory.pgsql.enabled = false;
     config.agent.memory.session_isolation.shared_main_scope_reads = sharedMainScopeReads;
 
+    await mkdir(join(workspacePath, 'memory', 'scopes', 'main'), { recursive: true });
     await mkdir(join(workspacePath, 'memory', 'scopes', 'group_demo'), { recursive: true });
     await writeFile(
-        join(workspacePath, 'MEMORY.md'),
+        join(workspacePath, 'memory', 'scopes', 'main', 'MEMORY.md'),
         '# Long-term Memory (main)\n\n[10:00:00] 团队共享排障经验：先确认当前日期再查询数据。\n',
         'utf-8',
     );
     await writeFile(
-        join(workspacePath, 'memory', 'scopes', 'group_demo', 'LONG_TERM.md'),
+        join(workspacePath, 'memory', 'scopes', 'group_demo', 'MEMORY.md'),
         '# Long-term Memory (group_demo)\n\n[10:05:00] 本群的本地上下文。\n',
         'utf-8',
     );
@@ -46,10 +47,10 @@ test('isolated scopes can search main shared memory when enabled', async (t) => 
     });
 
     const hits = await runtime.search('团队共享排障经验', scope);
-    assert.ok(hits.some((hit) => hit.path === 'MEMORY.md'));
+    assert.ok(hits.some((hit) => hit.path === 'memory/scopes/main/MEMORY.md'));
 
-    const result = await runtime.get('MEMORY.md', { from: 1, lines: 20 }, scope);
-    assert.equal(result.path, 'MEMORY.md');
+    const result = await runtime.get('memory/scopes/main/MEMORY.md', { from: 1, lines: 20 }, scope);
+    assert.equal(result.path, 'memory/scopes/main/MEMORY.md');
     assert.match(result.text, /先确认当前日期再查询数据/);
 });
 
@@ -61,10 +62,10 @@ test('isolated scopes still block main shared memory reads when disabled', async
     });
 
     const hits = await runtime.search('团队共享排障经验', scope);
-    assert.equal(hits.some((hit) => hit.path === 'MEMORY.md'), false);
+    assert.equal(hits.some((hit) => hit.path === 'memory/scopes/main/MEMORY.md'), false);
 
     await assert.rejects(
-        () => runtime.get('MEMORY.md', { from: 1, lines: 20 }, scope),
+        () => runtime.get('memory/scopes/main/MEMORY.md', { from: 1, lines: 20 }, scope),
         /memory_get path is not allowed/,
     );
 });

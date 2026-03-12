@@ -19,7 +19,7 @@ import {
     updateTokenCountWithModel,
     type MemoryFlushState,
 } from './middleware/index.js';
-import { resolveMemoryScope } from './middleware/memory-scope.js';
+import { resolveMemoryScope, withForcedMemoryScope, type MemoryScope } from './middleware/memory-scope.js';
 import { consumeQueuedWebReplyFiles } from './channels/web/context.js';
 import { buildAttachmentMediaContext } from './channels/media-context.js';
 import {
@@ -47,6 +47,11 @@ import {
 import type { RuntimeLogWriter } from './log/runtime.js';
 import { createSkillDirectoryMonitor, executeSkillSlashCommand, parseSkillSlashCommand } from './skills/index.js';
 import { executeCronSlashCommand } from './cron/slash.js';
+import {
+    buildSessionStartupMemoryInjection,
+    buildUserMessagesWithMemoryPolicy,
+    hasMemoryRecallIntent,
+} from './prompt/memory-policy.js';
 
 const conversationQueue = new Map<string, Promise<void>>();
 
@@ -56,6 +61,8 @@ interface WebConversationRuntimeState {
     totalInputTokens: number;
     totalOutputTokens: number;
     lastUpdatedAt: number;
+    scope: MemoryScope;
+    startupMemoryInjected: boolean;
 }
 
 export type WebSlashCommand =
@@ -337,6 +344,8 @@ function getOrCreateConversationState(
         totalInputTokens: 0,
         totalOutputTokens: 0,
         lastUpdatedAt: Date.now(),
+        scope: { key: 'main', kind: 'main' },
+        startupMemoryInjected: false,
     };
     conversationStates.set(conversationId, created);
     return created;
@@ -385,18 +394,22 @@ async function executeWebMemoryFlush(params: {
     config: ReturnType<typeof loadConfig>;
     conversationId: string;
     state: WebConversationRuntimeState;
+    scope: MemoryScope;
     log: WebLogger;
 }): Promise<boolean> {
     try {
-        const result = await params.agent.invoke(
-            {
-                messages: [{ role: 'user', content: buildMemoryFlushPrompt() }],
-            },
-            {
-                configurable: { thread_id: params.state.threadId },
-                recursionLimit: params.config.agent.recursion_limit,
-                version: 'v2',
-            },
+        const result = await withForcedMemoryScope(
+            params.scope,
+            () => params.agent.invoke(
+                {
+                    messages: [{ role: 'user', content: buildMemoryFlushPrompt() }],
+                },
+                {
+                    configurable: { thread_id: params.state.threadId },
+                    recursionLimit: params.config.agent.recursion_limit,
+                    version: 'v2',
+                },
+            ),
         );
         const messages = Array.isArray(result.messages) ? result.messages : [];
         const lastMessage = messages[messages.length - 1];
@@ -463,6 +476,7 @@ async function flushWebConversationsOnShutdown(params: {
                     config: params.config,
                     conversationId,
                     state,
+                    scope: state.scope,
                     log: params.log,
                 }),
                 flushTimeoutMs,
@@ -618,6 +632,26 @@ export async function startWebService(options?: {
 
                 const compactionModel = await getCompactionModel();
                 const scope = resolveMemoryScope(config.agent.memory.session_isolation);
+                conversationState.scope = scope;
+                const enforceMemorySearch = hasMemoryRecallIntent(userText);
+                if (enforceMemorySearch) {
+                    log.info(`[Web] Memory recall intent detected, enforce memory_search preflight (${message.conversationId})`);
+                }
+                const shouldInjectStartupMemory = !conversationState.startupMemoryInjected;
+                const startupMemoryInjection = shouldInjectStartupMemory
+                    ? await buildSessionStartupMemoryInjection({
+                        workspacePath: memoryWorkspacePath,
+                        scopeKey: scope.key,
+                    })
+                    : null;
+                if (shouldInjectStartupMemory) {
+                    conversationState.startupMemoryInjected = true;
+                }
+                if (startupMemoryInjection) {
+                    log.info(
+                        `[Web] Startup memory injection enabled for ${message.conversationId}, chars=${startupMemoryInjection.length}, scope=${scope.key}`
+                    );
+                }
                 await persistWebTurn({
                     workspacePath: memoryWorkspacePath,
                     config,
@@ -650,10 +684,12 @@ export async function startWebService(options?: {
                     scopeKey: scope.key,
                 });
 
-                invocationMessages.push({
-                    role: 'user',
-                    content: userText,
-                });
+                invocationMessages.push(
+                    ...buildUserMessagesWithMemoryPolicy(userText, {
+                        enforceMemorySearch,
+                        startupMemoryInjection,
+                    }),
+                );
 
                 await adapter.sendStreamEvent({
                     inbound: message,
@@ -905,6 +941,7 @@ export async function startWebService(options?: {
                             config,
                             conversationId: message.conversationId,
                             state: conversationState,
+                            scope,
                             log,
                         });
                     }

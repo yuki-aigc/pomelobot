@@ -224,13 +224,13 @@ function inferSourceType(relPath: string): MemorySourceType {
 
 function isSharedMainReadableRelPath(relPath: string): boolean {
     const normalized = relPath.replace(/\\/g, '/');
-    if (normalized === 'MEMORY.md' || normalized === 'HEARTBEAT.md') {
+    if (normalized === 'memory/scopes/main/MEMORY.md') {
         return true;
     }
-    if (/^memory\/[^/]+\.md$/u.test(normalized)) {
+    if (normalized === 'memory/scopes/main/HEARTBEAT.md') {
         return true;
     }
-    return normalized === 'memory/scopes/main/HEARTBEAT.md';
+    return /^memory\/scopes\/main\/\d{4}-\d{2}-\d{2}\.md$/u.test(normalized);
 }
 
 function toVectorLiteral(embedding: number[]): string {
@@ -1088,16 +1088,7 @@ export class MemoryRuntime {
 
     private async listIndexableFiles(): Promise<string[]> {
         const files: string[] = [];
-        const longTermMain = join(this.workspacePath, 'MEMORY.md');
-        const heartbeatMain = join(this.workspacePath, 'HEARTBEAT.md');
         const memoryDir = join(this.workspacePath, 'memory');
-
-        if (existsSync(longTermMain)) {
-            files.push(longTermMain);
-        }
-        if (existsSync(heartbeatMain)) {
-            files.push(heartbeatMain);
-        }
 
         if (existsSync(memoryDir)) {
             await walkMarkdownFiles(memoryDir, files);
@@ -1543,15 +1534,6 @@ export class MemoryRuntime {
         }
 
         if (scope.key === 'main') {
-            if (normalized === 'MEMORY.md') {
-                return true;
-            }
-            if (normalized === 'HEARTBEAT.md') {
-                return true;
-            }
-            if (/^memory\/[^/]+\.md$/u.test(normalized)) {
-                return true;
-            }
             return normalized.startsWith('memory/scopes/main/');
         }
 
@@ -2191,56 +2173,22 @@ export class MemoryRuntime {
     private async collectReadableFilesForScope(scope: MemoryScope, fileSet: Set<string>): Promise<void> {
         const scopePaths = this.resolveScopePaths(scope);
 
-        if (existsSync(scopePaths.longTermPath)) {
-            fileSet.add(scopePaths.longTermPath);
-        }
-        if (scope.key === 'main') {
-            const heartbeatMainPath = join(this.workspacePath, 'HEARTBEAT.md');
-            if (existsSync(heartbeatMainPath)) {
-                fileSet.add(heartbeatMainPath);
-            }
+        if (!existsSync(scopePaths.scopeRoot)) {
+            return;
         }
 
-        if (existsSync(scopePaths.dailyDir)) {
-            if (scope.key === 'main') {
-                const entries = await readdir(scopePaths.dailyDir, { withFileTypes: true }).catch(() => []);
-                for (const entry of entries) {
-                    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-                    fileSet.add(join(scopePaths.dailyDir, entry.name));
-                }
-                if (existsSync(scopePaths.scopeRoot)) {
-                    const scopedMainFiles: string[] = [];
-                    await walkMarkdownFiles(scopePaths.scopeRoot, scopedMainFiles);
-                    for (const file of scopedMainFiles) {
-                        fileSet.add(file);
-                    }
-                }
-            } else {
-                const scopedFiles: string[] = [];
-                await walkMarkdownFiles(scopePaths.dailyDir, scopedFiles);
-                for (const file of scopedFiles) {
-                    fileSet.add(file);
-                }
-            }
-        }
-
-        if (this.memoryConfig.transcript.enabled && scope.key === 'main') {
-            const transcriptDir = join(this.workspacePath, 'memory', 'scopes', scope.key, 'transcripts');
-            if (existsSync(transcriptDir)) {
-                const transcriptFiles: string[] = [];
-                await walkMarkdownFiles(transcriptDir, transcriptFiles);
-                for (const file of transcriptFiles) {
-                    fileSet.add(file);
-                }
-            }
+        const scopedFiles: string[] = [];
+        await walkMarkdownFiles(scopePaths.scopeRoot, scopedFiles);
+        for (const file of scopedFiles) {
+            fileSet.add(file);
         }
     }
 
     private async collectSharedMainReadableFiles(fileSet: Set<string>): Promise<void> {
+        const mainScopeDir = join(this.workspacePath, 'memory', 'scopes', 'main');
         const sharedCandidates = [
-            join(this.workspacePath, 'MEMORY.md'),
-            join(this.workspacePath, 'HEARTBEAT.md'),
-            join(this.workspacePath, 'memory', 'scopes', 'main', 'HEARTBEAT.md'),
+            join(mainScopeDir, 'MEMORY.md'),
+            join(mainScopeDir, 'HEARTBEAT.md'),
         ];
         for (const candidate of sharedCandidates) {
             if (existsSync(candidate)) {
@@ -2248,17 +2196,19 @@ export class MemoryRuntime {
             }
         }
 
-        const dailyDir = join(this.workspacePath, 'memory');
-        if (!existsSync(dailyDir)) {
+        if (!existsSync(mainScopeDir)) {
             return;
         }
 
-        const entries = await readdir(dailyDir, { withFileTypes: true }).catch(() => []);
+        const entries = await readdir(mainScopeDir, { withFileTypes: true }).catch(() => []);
         for (const entry of entries) {
             if (!entry.isFile() || !entry.name.endsWith('.md')) {
                 continue;
             }
-            fileSet.add(join(dailyDir, entry.name));
+            if (entry.name === 'MEMORY.md' || entry.name === 'HEARTBEAT.md') {
+                continue;
+            }
+            fileSet.add(join(mainScopeDir, entry.name));
         }
     }
 }

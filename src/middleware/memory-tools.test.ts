@@ -86,7 +86,7 @@ test('memory_save_team promotes scoped memory into main long-term memory', async
         },
     );
 
-    const mainMemory = await readFile(join(workspacePath, 'MEMORY.md'), 'utf-8');
+    const mainMemory = await readFile(join(workspacePath, 'memory', 'scopes', 'main', 'MEMORY.md'), 'utf-8');
     assert.match(mainMemory, /## 团队记忆条目/);
     assert.match(mainMemory, /- 标题: 查询历史数据前先确认日期/);
     assert.match(mainMemory, /统一规范：查历史数据前先确认日期/);
@@ -139,7 +139,7 @@ test('memory_save_team merges entries with the same title instead of appending d
         },
     );
 
-    const mainMemory = await readFile(join(workspacePath, 'MEMORY.md'), 'utf-8');
+    const mainMemory = await readFile(join(workspacePath, 'memory', 'scopes', 'main', 'MEMORY.md'), 'utf-8');
     const occurrences = (mainMemory.match(/## 团队记忆条目/g) || []).length;
     assert.equal(occurrences, 1);
     assert.match(mainMemory, /第一次沉淀：先确认当前日期。[\s\S]*补充：第二次补充：再确认用户目标日期。/);
@@ -185,7 +185,7 @@ test('memory_save_team accepts multiline string fields for list sections', async
         },
     );
 
-    const mainMemory = await readFile(join(workspacePath, 'MEMORY.md'), 'utf-8');
+    const mainMemory = await readFile(join(workspacePath, 'memory', 'scopes', 'main', 'MEMORY.md'), 'utf-8');
     assert.match(mainMemory, /1\. 执行 date 命令确认当前系统日期和时间/);
     assert.match(mainMemory, /2\. 根据确认后的日期计算查询时间范围/);
     assert.match(mainMemory, /- 不要假设或硬编码日期/);
