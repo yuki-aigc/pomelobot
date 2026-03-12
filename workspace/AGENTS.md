@@ -1,4 +1,4 @@
-# Pomelobot AGENTS
+# Pomeloclaw AGENTS
 
 ## Purpose
 定义项目级协作规范（软约定层），强调“高质量交付、可复盘、少废话”。

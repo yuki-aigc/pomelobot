@@ -1,4 +1,4 @@
-# Pomelobot Dockerfile (production-friendly, keep original Ubuntu tooling)
+# Pomeloclaw Dockerfile (production-friendly, keep original Ubuntu tooling)
 
 # -------- Base stage: keep original image + preinstalled tools --------
 FROM ubuntu:24.04 AS base

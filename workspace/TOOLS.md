@@ -1,4 +1,4 @@
-# Pomelobot TOOLS
+# Pomeloclaw TOOLS
 
 ## Purpose
 定义工具调用约定（策略层），目标是“少猜测、可验证、可回滚”。

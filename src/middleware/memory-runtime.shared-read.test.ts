@@ -12,7 +12,7 @@ async function createTestRuntime(sharedMainScopeReads: boolean): Promise<{
     workspacePath: string;
     scope: MemoryScope;
 }> {
-    const workspacePath = await mkdtemp(join(tmpdir(), 'pomelobot-memory-'));
+    const workspacePath = await mkdtemp(join(tmpdir(), 'pomeloclaw-memory-'));
     const config = structuredClone(DEFAULT_CONFIG);
     config.agent.memory.backend = 'filesystem';
     config.agent.memory.pgsql.enabled = false;

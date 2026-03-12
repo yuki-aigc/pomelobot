@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/Pomelobot.png" alt="Pomelobot" width="280" />
+  <img src="docs/Pomeloclaw.png" alt="Pomeloclaw" width="280" />
 </p>
 
-<h1 align="center">Pomelobot</h1>
+<h1 align="center">Pomeloclaw</h1>
 
 <p align="center">
   基于 <a href="https://github.com/DeepAgentsAI/DeepAgentsJS">DeepAgentsJS</a> + <a href="https://github.com/langchain-ai/langgraphjs">LangGraph</a> 构建的智能助手，参考了 OpenClaw 的设计理念。<br/>
@@ -118,7 +118,7 @@ pnpm start:server
 ## 项目结构
 
 ```text
-pomelobot/
+pomeloclaw/
 ├── src/
 │   ├── index.ts                 # CLI 入口
 │   ├── dingtalk.ts              # DingTalk 入口
@@ -224,7 +224,7 @@ export OPENAI_MODEL="gpt-4o"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
-敏感配置推荐放在 `~/.pomelobot/credentials/.env`（可通过 `POMELOBOT_CREDENTIALS_ENV_PATH` 自定义路径），格式示例：
+敏感配置推荐放在 `~/.pomeloclaw/credentials/.env`（可通过 `POMELOCLAW_CREDENTIALS_ENV_PATH` 自定义路径），格式示例：
 
 ```bash
 OPENAI_API_KEY="sk-xxx"
@@ -235,7 +235,7 @@ MEMORY_PG_PASSWORD="xxx"
 读取优先级：
 
 1. `config.json` 中已配置的值（优先）
-2. 进程环境变量 / `~/.pomelobot/credentials/.env` 作为兜底
+2. 进程环境变量 / `~/.pomeloclaw/credentials/.env` 作为兜底
 
 说明：
 
@@ -264,11 +264,11 @@ MEMORY_PG_PASSWORD="xxx"
         "connection_string": "",      // 推荐通过环境变量 MEMORY_PG_CONNECTION_STRING 注入
         "host": "127.0.0.1",
         "port": 5432,
-        "user": "pomelobot",
+        "user": "pomeloclaw",
         "password": "",
-        "database": "pomelobot",
+        "database": "pomeloclaw",
         "ssl": false,
-        "schema": "pomelobot_memory"
+        "schema": "pomeloclaw_memory"
       },
       "retrieval": {
         "mode": "hybrid",             // keyword | fts | vector | hybrid
@@ -471,7 +471,7 @@ MEMORY_PG_PASSWORD="xxx"
         "cron": {
             "defaultTarget": "cidxxxx",     // 定时任务默认推送群（openConversationId）
             "useMarkdown": true,
-            "title": "Pomelobot 定时任务",
+            "title": "Pomeloclaw 定时任务",
             "autoMemorySaveAt4": true       // 启动时幂等确保 04:00 每日记忆归档任务
         },
         "execApprovals": {
@@ -520,7 +520,7 @@ MEMORY_PG_PASSWORD="xxx"
         "port": 18081,
         "path": "/ws/web",
         "uiPath": "/web",
-        "title": "Pomelobot Web",
+        "title": "Pomeloclaw Web",
         "authToken": "",                   // 可选：浏览器 hello 认证
         "debug": false,
         "maxPayloadBytes": 1048576,
@@ -563,7 +563,7 @@ MEMORY_PG_PASSWORD="xxx"
 助手: 已保存到长期记忆
 
 你: /status
-助手: 🤖 Pomelobot v1.0.0
+助手: 🤖 Pomeloclaw v1.0.0
       🧠 Model: openai/gpt-4o ...
       🧮 Tokens: 1.2k in / 0.8k out ...
 
@@ -705,8 +705,8 @@ CHANNELS=web pnpm run server
 
 ```bash
 # Mac 用户需指定 --platform linux/amd64
-docker build --platform linux/amd64 -f deploy/Dockerfile -t your-registry/pomelobot:latest .
-docker push your-registry/pomelobot:latest
+docker build --platform linux/amd64 -f deploy/Dockerfile -t your-registry/pomeloclaw:latest .
+docker push your-registry/pomeloclaw:latest
 ```
 
 ### K8s 部署

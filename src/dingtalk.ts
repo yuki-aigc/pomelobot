@@ -256,7 +256,7 @@ async function acquireDingTalkStreamLock(params: {
     const lockKey2 = lockDigest.readInt32BE(4);
     const client = new PgClient({
         ...clientConfig,
-        application_name: `pomelobot-dingtalk-lock:${instanceId}`,
+        application_name: `pomeloclaw-dingtalk-lock:${instanceId}`,
     });
 
     try {
@@ -388,13 +388,13 @@ function instrumentDingTalkClient(client: DWClient, log: Logger, instanceId: str
     let connectAttempt = 0;
 
     const attachSocketInstrumentation = (socket: any): void => {
-        if (!socket || socket.__pomelobotInstrumented) {
+        if (!socket || socket.__pomeloclawInstrumented) {
             return;
         }
-        socket.__pomelobotInstrumented = true;
+        socket.__pomeloclawInstrumented = true;
 
         socket.on('open', () => {
-            client.emit('pomelobot:stream:socket_open');
+            client.emit('pomeloclaw:stream:socket_open');
         });
     };
 
@@ -423,14 +423,14 @@ function instrumentDingTalkClient(client: DWClient, log: Logger, instanceId: str
 
             const cleanup = () => {
                 clearTimeout(timer);
-                client.off('pomelobot:stream:registered', onRegistered);
-                client.off('pomelobot:stream:open', onOpen);
-                client.off('pomelobot:stream:socket_open', onOpen);
+                client.off('pomeloclaw:stream:registered', onRegistered);
+                client.off('pomeloclaw:stream:open', onOpen);
+                client.off('pomeloclaw:stream:socket_open', onOpen);
             };
 
-            client.on('pomelobot:stream:registered', onRegistered);
-            client.on('pomelobot:stream:open', onOpen);
-            client.on('pomelobot:stream:socket_open', onOpen);
+            client.on('pomeloclaw:stream:registered', onRegistered);
+            client.on('pomeloclaw:stream:open', onOpen);
+            client.on('pomeloclaw:stream:socket_open', onOpen);
         });
 
     const originalConnect = client.connect.bind(client);
@@ -475,9 +475,9 @@ function instrumentDingTalkClient(client: DWClient, log: Logger, instanceId: str
         rawClient.onSystem = (downstream: { headers?: { topic?: string }; data?: string }) => {
             const topic = downstream?.headers?.topic || 'unknown';
             if (topic === 'CONNECTED') {
-                client.emit('pomelobot:stream:open');
+                client.emit('pomeloclaw:stream:open');
             } else if (topic === 'REGISTERED') {
-                client.emit('pomelobot:stream:registered');
+                client.emit('pomeloclaw:stream:registered');
             }
             const result = originalOnSystem(downstream);
             if (topic === 'disconnect') {
@@ -714,7 +714,7 @@ export async function startDingTalkService(options?: {
     // Create DingTalk Stream client
     log.info('[DingTalk] Connecting to DingTalk Stream...');
     const streamInstanceId = `${hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
-    const streamUA = `pomelobot/${streamInstanceId}`;
+    const streamUA = `pomeloclaw/${streamInstanceId}`;
     let streamLock: StreamLockHandle | null = await acquireDingTalkStreamLock({
         config,
         clientId: dingtalkConfig.clientId,

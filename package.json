@@ -1,7 +1,7 @@
 {
-    "name": "pomelobot",
+    "name": "pomeloclaw",
     "version": "1.0.0",
-    "description": "Pomelobot: 智能助手，支持记忆、技能、定时任务与多渠道接入",
+    "description": "Pomeloclaw: 智能助手，支持记忆、技能、定时任务与多渠道接入",
     "main": "dist/index.js",
     "type": "module",
     "scripts": {

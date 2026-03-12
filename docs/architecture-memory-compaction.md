@@ -1,4 +1,4 @@
-# Memory + Compaction 流程图（Pomelobot）
+# Memory + Compaction 流程图（Pomeloclaw）
 
 本文提供端到端流程图，覆盖：
 - 在线消息处理路径（含 memory flush 与 compaction）
